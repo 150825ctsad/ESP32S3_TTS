@@ -14,6 +14,6 @@
     "--query-driver=**",
     "--compile-commands-dir=d:\\code\\TTS\\build"
   ],
-  "idf.portWin": "COM3",
+  "idf.portWin": "COM4",
   "idf.flashType": "UART"
 }

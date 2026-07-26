@@ -5,6 +5,8 @@ idf_component_register( SRCS
                         "."
 
                         REQUIRES 
+                        relay
+                        wifi_cfg
                         TTS
                         sr_ringbuf 
                         player 
