@@ -27,9 +27,7 @@
  * 
  */
 
-#if CONFIG_ESP32_S3_BOX_BOARD
-    #include "esp32_s3_box_board.h"
-#elif CONFIG_ESP32_S3_MAX98357A_BOARD
+#if CONFIG_ESP32_S3_MAX98357A_BOARD
     #include "esp32_s3_max98357a_board.h"
 #elif CONFIG_ESP32_S3_KORVO_1_V4_0_BOARD
     #include "esp32_s3_korvo_1_v4_board.h"
@@ -37,18 +35,10 @@
     #include "esp32_korvo_v1_1_board.h"
 #elif CONFIG_ESP32_S3_KORVO_2_V3_0_BOARD
     #include "esp32_s3_korvo_2_v3_board.h"
-#elif CONFIG_ESP32_S3_EYE_BOARD
-    #include "esp32_s3_eye_board.h"
 #elif CONFIG_ESP_CUSTOM_BOARD
     #include "esp_custom_board.h"
-#elif CONFIG_ESP32_S3_BOX_LITE_BOARD
-    #include "esp32_s3_box_lite_board.h"
 #elif CONFIG_ESP32_S3_AFE_RASPBERRY_BOARD
     #include "esp32_s3_afe_raspberry_board.h"
-#elif CONFIG_ESP32_S3_BOX_3_BOARD
-    #include "esp32_s3_box_3_board.h"
-#elif CONFIG_ESP32_P4_FUNCTION_EV_BOARD
-    #include "esp32_p4_function_ev_board.h"
 #else 
     
 #endif

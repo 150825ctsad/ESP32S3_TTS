@@ -42,7 +42,7 @@ set(voice_data_image ${PROJECT_DIR}/../../components/esp-sr/esp-tts/esp_tts_chin
 source flash_voicedata.sh ../../components/esp-sr/esp-tts/esp_tts_chinese/esp_tts_voice_data_xiaoxin_small.dat  /dev/ttyUSB0
 ```
 
-python -m esptool -p COMx -b 921600 write_flash 0x416000 managed_components\espressif__esp-sr\esp-tts\esp_tts_chinese\esp_tts_voice_data_xiaoxin_custom.dat
+python -m esptool -p COM4 -b 921600 write_flash 0x416000 managed_components\espressif__esp-sr\esp-tts\esp_tts_chinese\esp_tts_voice_data_xiaoxin_custom.dat
 
 ### 例程输出
 

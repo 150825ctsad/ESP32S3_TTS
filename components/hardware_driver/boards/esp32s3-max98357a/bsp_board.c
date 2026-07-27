@@ -43,11 +43,12 @@ static esp_err_t bsp_i2s_init(i2s_port_t i2s_num, uint32_t sample_rate,
 {
     esp_err_t ret_val = ESP_OK;
 
-    i2s_slot_mode_t slot_mode = I2S_SLOT_MODE_MONO;
-    if (channel_format == 2) {
-        slot_mode = I2S_SLOT_MODE_STEREO;
-    } else if (channel_format != 1) {
-        ESP_LOGW(TAG, "Unsupported channel_format %d, fallback to mono", channel_format);
+    /* MAX98357A requires BCLK/LRCK ratio ≥ 32.
+     * In MONO mode with 16-bit slots: ratio = 16 → amp won't lock.
+     * Force STEREO slot mode: ratio = 16*2 = 32 (the minimum). */
+    i2s_slot_mode_t slot_mode = I2S_SLOT_MODE_STEREO;
+    if (channel_format != 1 && channel_format != 2) {
+        ESP_LOGW(TAG, "Unsupported channel_format %d, fallback to stereo", channel_format);
     }
 
     if (bits_per_chan != 16 && bits_per_chan != 24 && bits_per_chan != 32) {

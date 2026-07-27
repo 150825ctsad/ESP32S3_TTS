@@ -14,23 +14,6 @@ if(CONFIG_ESP32_KORVO_V1_1_BOARD)
     list(APPEND BSP_BOARD_SRC "./boards/esp32-korvo")
 endif()
 
-if(CONFIG_ESP32_S3_BOX_BOARD)
-    list(APPEND BSP_BOARD_SRC "./boards/esp32s3-box")
-endif()
-
-if(CONFIG_ESP32_S3_BOX_3_BOARD)
-    list(APPEND BSP_BOARD_SRC "./boards/esp32s3-box-3")
-endif()
-
-if(CONFIG_ESP32_S3_EYE_BOARD)
-    list(APPEND BSP_BOARD_SRC "./boards/esp32s3-eye")
-endif()
-
-if(CONFIG_ESP32_P4_FUNCTION_EV_BOARD)
-    list(APPEND BSP_BOARD_SRC "./boards/esp32p4-function-ev")
-endif()
-
-
 idf_component_register(
     SRC_DIRS
         ./

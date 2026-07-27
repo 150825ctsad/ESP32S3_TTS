@@ -189,8 +189,11 @@ static void publish_sensor_data(void)
     /*  构造 JSON（这里用整数/浮点均可） */
     static char json[256];
     int len = snprintf(json, sizeof(json),
-        "{\"timestamp\":%lu,\"device\":\"%s\",\"fw\":\"1.0.0\"}",
-        (unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS),MQTT_CLIENT_ID);
+        "{\"timestamp\":%lu,\"relay\":\"%s\",\"device\":\"%s\",\"fw\":\"1.0.0\"}",
+        
+        (unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS),
+        (relay_state == 0 ? "off" : "on"),
+        MQTT_CLIENT_ID);
 
     if (len > 0 && len < sizeof(json)) {
         int msg_id = esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_SENSOR, json, 0, 0, 0);

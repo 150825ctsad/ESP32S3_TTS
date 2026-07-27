@@ -75,7 +75,7 @@
 /**
  * @brief Default playback volume (0-100)
  */
-#define PLAYER_VOLUME   (50)
+#define PLAYER_VOLUME   (100)
 
 /**
  * @brief PA power control via MAX98357A SD_MODE pin

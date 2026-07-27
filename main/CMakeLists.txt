@@ -1,4 +1,4 @@
-idf_component_register( SRCS 
+﻿idf_component_register( SRCS 
                         "main.c"
 
                         INCLUDE_DIRS 
@@ -9,6 +9,4 @@ idf_component_register( SRCS
                         wifi_cfg
                         TTS
                         sr_ringbuf 
-                        player 
-                        perf_tester 
                         hardware_driver)
