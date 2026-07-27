@@ -14,30 +14,36 @@
 #include "esp_idf_version.h"
 
 #include "TTS.h"
-
 #include "wifi_cfg.h"
 #include "relay.h"
 
+/* ================================================================ */
+/*  Constants                                                        */
+/* ================================================================ */
 #define TTS_QUEUE_LEN   10
 #define TTS_TEXT_MAX    1024
 
+#define CONFIG_TTS_SPEECH_SPEED 3
+
+/* ================================================================ */
+/*  Globals                                                          */
+/* ================================================================ */
 static esp_tts_handle_t *tts_handle = NULL;
-ringbuf_handle_t urat_rb = NULL;
+ringbuf_handle_t urat_rb = NULL;          // used by TTS.c UART task
 static QueueHandle_t     tts_queue = NULL;
 
-/* ---------------------------------------------------------------- */
-/*  Synchronous TTS playback                                        */
-/* ---------------------------------------------------------------- */
+/* ================================================================ */
+/*  tts_speak  -- synchronous TTS playback                           */
+/* ================================================================ */
 static void tts_speak(const char *text)
 {
     if (tts_handle == NULL || text == NULL) return;
-
     printf("TTS: %s\n", text);
 
     if (esp_tts_parse_chinese(tts_handle, text)) {
         int len[1] = {0};
         do {
-            short *pcm = esp_tts_stream_play(tts_handle, len, 3);
+            short *pcm = esp_tts_stream_play(tts_handle, len, CONFIG_TTS_SPEECH_SPEED);
             esp_audio_play(pcm, len[0] * 2, portMAX_DELAY);
         } while (len[0] > 0);
     }
@@ -45,9 +51,9 @@ static void tts_speak(const char *text)
     esp_tts_stream_reset(tts_handle);
 }
 
-/* ---------------------------------------------------------------- */
-/*  TTS task - receives text from queue, speaks it                  */
-/* ---------------------------------------------------------------- */
+/* ================================================================ */
+/*  tts_task  -- FreeRTOS task: dequeues text and speaks it          */
+/* ================================================================ */
 static void tts_task(void *arg)
 {
     char text[TTS_TEXT_MAX + 1];
@@ -58,9 +64,9 @@ static void tts_task(void *arg)
     }
 }
 
-/* ---------------------------------------------------------------- */
-/*  Speech API: called from anywhere to queue a phrase               */
-/* ---------------------------------------------------------------- */
+/* ================================================================ */
+/*  tts_speak_async  -- public API, non-blocking                     */
+/* ================================================================ */
 void tts_speak_async(const char *text)
 {
     if (tts_queue == NULL || text == NULL) return;
@@ -70,23 +76,16 @@ void tts_speak_async(const char *text)
     xQueueSend(tts_queue, buf, 0);
 }
 
-/* ---------------------------------------------------------------- */
-/*  app_main                                                         */
-/* ---------------------------------------------------------------- */
-int app_main()
+/* ================================================================ */
+/*  tts_init  -- load voice data, create handle + task + queue       */
+/* ================================================================ */
+static esp_err_t tts_init(void)
 {
-
-    // 初始化各个外设
-    relay_init(); // 初始化继电器
-    wifi_init_sta(); // 初始化WiFi
-
-    ESP_ERROR_CHECK(esp_board_init(16000, 1, 16));
-
     const esp_partition_t *part = esp_partition_find_first(
         ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "voice_data");
     if (part == NULL) {
         printf("Couldn't find voice data partition!\n");
-        return 0;
+        return ESP_ERR_NOT_FOUND;
     }
     printf("voice_data partition size: %lu\n", part->size);
 
@@ -102,7 +101,7 @@ int app_main()
 #endif
     if (err != ESP_OK) {
         printf("Couldn't map voice data partition!\n");
-        return 0;
+        return err;
     }
 
     esp_tts_voice_t *voice = esp_tts_voice_set_init(
@@ -112,8 +111,14 @@ int app_main()
     tts_queue = xQueueCreate(TTS_QUEUE_LEN, TTS_TEXT_MAX + 1);
     xTaskCreatePinnedToCore(tts_task, "tts_task", 8 * 1024, NULL, 5, NULL, 1);
 
-    tts_speak("欢迎使用乐鑫语音合成");
+    return ESP_OK;
+}
 
+/* ================================================================ */
+/*  uart_input_task  -- reads UART lines, feeds to tts_speak_async   */
+/* ================================================================ */
+static void uart_input_task(void *arg)
+{
     urat_rb = rb_create(URAT_BUF_LEN, 1);
     xTaskCreatePinnedToCore(&uartTask, "urat", 6 * 1024, NULL, 5, NULL, 0);
 
@@ -138,6 +143,26 @@ int app_main()
             data_len = 0;
         }
     }
+}
 
+/* ================================================================ */
+/*  app_main  -- entry point: init everything, then let tasks run     */
+/* ================================================================ */
+int app_main()
+{
+    relay_init();
+    ESP_ERROR_CHECK(esp_board_init(16000, 1, 16));
+
+    if (tts_init() != ESP_OK) return 0;
+
+    wifi_init_sta();
+    xTaskCreatePinnedToCore(uart_input_task, "uart_in", 4 * 1024, NULL, 5, NULL, 0);
+
+    /* 非阻塞播报启动提示 —— TTS 任务已就绪 */
+    tts_speak_async("欢迎使用乐鑫语音合成");
+
+    while(1){
+        vTaskDelay(1000);
+    }
     return 0;
 }

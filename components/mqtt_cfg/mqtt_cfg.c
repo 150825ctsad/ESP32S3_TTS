@@ -6,11 +6,12 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "relay.h"
+#include "TTS.h"
 #include "mbedtls/base64.h"
 #include "cJSON.h"
 
 #define TAG                    "MQTT_CLIENT"
-#define MQTT_BROKER_URI        "tcp://192.168.2.112"
+#define MQTT_BROKER_URI        "mqtt://192.168.1.200"
 #define MQTT_BROKER_PORT       1883
 
 #define MQTT_CLIENT_ID         "esp32s3"
@@ -113,8 +114,15 @@ static void mqtt_event_callback(void *handler_args,
                     ESP_LOGE(TAG, "Invalid relay value: %s (expected 'on' or 'off')", relay->valuestring);
                 }
             } else {
-                ESP_LOGW(TAG, "Missing or invalid 'relay' field");
+                ESP_LOGD(TAG, "No relay field in message");
             }
+            // 3.2 TTS 语音播报（tts: "文本内容"）
+            cJSON *tts = cJSON_GetObjectItemCaseSensitive(root, "tts");
+            if (cJSON_IsString(tts) && tts->valuestring != NULL) {
+                tts_speak_async(tts->valuestring);
+                ESP_LOGI(TAG, "TTS queued: %s", tts->valuestring);
+            }
+
             // 4. 释放资源
             cJSON_Delete(root);
             free(msg_str);
@@ -219,8 +227,8 @@ void mqtt_task(void *pvParameters)
             continue;
         }
 
-        /* 每 1 秒发布一次数据 */
+        /* 每 5 秒发布一次数据 */
         publish_sensor_data();
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
