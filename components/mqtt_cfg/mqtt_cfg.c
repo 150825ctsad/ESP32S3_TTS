@@ -47,23 +47,26 @@ static void handle_mqtt_command(const mqtt_cmd_msg_t *msg)
     }
 
     /* ---- relay control: {"box1":"on"}, {"box2":"off"}, ... ---- */
-    for (int i = 1; i <= RELAY_COUNT; i++) {
+    for (int i = 1; i <= RELAY_COUNT; i++)
+    {
         char key[8];
         snprintf(key, sizeof(key), "box%d", i);
-        cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
-        if (cJSON_IsString(item) && item->valuestring) {
-            uint8_t cmd_on = (strcmp(item->valuestring, "on") == 0) ? 1 : 0;
-            relay_set(i, cmd_on);
-            vTaskDelay(pdMS_TO_TICKS(150));
-            uint8_t actual = gpio_get_level(relay_state_pins[i - 1]);
-            if (actual == cmd_on) {
-                ESP_LOGI(TAG, "Box%d %s [state OK]", i, cmd_on ? "ON" : "OFF");
-            } else {
-                ESP_LOGW(TAG, "Box%d %s [state MISMATCH: cmd=%d gpio=%d]", i,
-                         cmd_on ? "ON" : "OFF", cmd_on, actual);
-            }
-        }
-    }
+            cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+                if (!cJSON_IsString(item) || item->valuestring == NULL)
+                    continue;
+
+                if(strcmp(item->valuestring,"on") != 0)
+                    continue;
+
+            uint8_t state = box_state[i-1];
+                if(state == 1){
+                    ESP_LOGW(TAG,"Box%d already ON, reject",i);
+                    continue;
+                }
+        ESP_LOGI(TAG,"Box%d trigger",i);
+        box_trigger(i,1);
+
+}
 
 /* ---- TTS speech ---- */
     cJSON *tts = cJSON_GetObjectItemCaseSensitive(root, "tts");
