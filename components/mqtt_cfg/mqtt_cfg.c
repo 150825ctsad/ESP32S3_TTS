@@ -7,6 +7,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "relay.h"
+#include "driver/gpio.h"
 #include "TTS.h"
 #include "cJSON.h"
 
@@ -20,8 +21,7 @@
 #define MQTT_TOPIC_SENSOR      "test/ESP-IDF/SENSOR_DATA"
 #define MQTT_TOPIC_COMMAND     "test/ESP-IDF/COMMAND"
 
-// 消息队列：MQTT回调转发指令，避免在回调中执行业务
-#define MQTT_CMD_QUEUE_LEN     8
+#define MQTT_CMD_QUEUE_LEN     16
 typedef struct {
     char topic[64];
     char payload[256];
@@ -33,112 +33,41 @@ static bool mqtt_connected = false;
 static int reconnect_attempts = 0;
 static bool has_subscribed = false;
 
-/* ---------- 从队列处理收到的MQTT指令（独立任务上下文，安全） ---------- */
+/* ================================================================ */
+/*  handle_mqtt_command  -- parse JSON, control relay + TTS          */
+/* ================================================================ */
 static void handle_mqtt_command(const mqtt_cmd_msg_t *msg)
 {
     ESP_LOGI(TAG, "Topic: %s, Payload: %s", msg->topic, msg->payload);
 
     cJSON *root = cJSON_Parse(msg->payload);
     if (root == NULL) {
-        const char *error_ptr = cJSON_GetErrorPtr();
-        if (error_ptr != NULL) {
-            ESP_LOGE(TAG, "JSON parse error before: %s", error_ptr);
-        }
+        ESP_LOGE(TAG, "JSON parse error: %s", cJSON_GetErrorPtr());
         return;
     }
 
-    // 继电器1
-    cJSON *relay1 = cJSON_GetObjectItemCaseSensitive(root, "relay1");
-    if (cJSON_IsString(relay1) && relay1->valuestring != NULL) {
-        if (strcmp(relay1->valuestring, "on") == 0) {
-            relay_on(GPIO_NUM_RELAY1);
-            ESP_LOGI(TAG, "Relay1 ON");
-        } else if (strcmp(relay1->valuestring, "off") == 0) {
-            relay_off(GPIO_NUM_RELAY1);
-            ESP_LOGI(TAG, "Relay1 OFF");
-        }
-    }
-    // 继电器2
-    cJSON *relay2 = cJSON_GetObjectItemCaseSensitive(root, "relay2");
-    if (cJSON_IsString(relay2) && relay2->valuestring != NULL) {
-        if (strcmp(relay2->valuestring, "on") == 0) {
-            relay_on(GPIO_NUM_RELAY2);
-            ESP_LOGI(TAG, "Relay2 ON");
-        } else if (strcmp(relay2->valuestring, "off") == 0) {
-            relay_off(GPIO_NUM_RELAY2);
-            ESP_LOGI(TAG, "Relay2 OFF");
-        }
-    }
-    // 继电器3
-    cJSON *relay3 = cJSON_GetObjectItemCaseSensitive(root, "relay3");
-    if (cJSON_IsString(relay3) && relay3->valuestring != NULL) {
-        if (strcmp(relay3->valuestring, "on") == 0) {
-            relay_on(GPIO_NUM_RELAY3);
-            ESP_LOGI(TAG, "Relay3 ON");
-        } else if (strcmp(relay3->valuestring, "off") == 0) {
-            relay_off(GPIO_NUM_RELAY3);
-            ESP_LOGI(TAG, "Relay3 OFF");
-        }
-    }
-    // 继电器4
-    cJSON *relay4 = cJSON_GetObjectItemCaseSensitive(root, "relay4");
-    if (cJSON_IsString(relay4) && relay4->valuestring != NULL) {
-        if (strcmp(relay4->valuestring, "on") == 0) {
-            relay_on(GPIO_NUM_RELAY4);
-            ESP_LOGI(TAG, "Relay4 ON");
-        } else if (strcmp(relay4->valuestring, "off") == 0) {
-            relay_off(GPIO_NUM_RELAY4);
-            ESP_LOGI(TAG, "Relay4 OFF");
-        }
-    }
-    // 继电器5
-    cJSON *relay5 = cJSON_GetObjectItemCaseSensitive(root, "relay5");
-    if (cJSON_IsString(relay5) && relay5->valuestring != NULL) {
-        if (strcmp(relay5->valuestring, "on") == 0) {
-            relay_on(GPIO_NUM_RELAY5);
-            ESP_LOGI(TAG, "Relay5 ON");
-        } else if (strcmp(relay5->valuestring, "off") == 0) {
-            relay_off(GPIO_NUM_RELAY5);
-            ESP_LOGI(TAG, "Relay5 OFF");
-        }
-    }
-    // 继电器6
-    cJSON *relay6 = cJSON_GetObjectItemCaseSensitive(root, "relay6");
-    if (cJSON_IsString(relay6) && relay6->valuestring != NULL) {
-        if (strcmp(relay6->valuestring, "on") == 0) {
-            relay_on(GPIO_NUM_RELAY6);
-            ESP_LOGI(TAG, "Relay6 ON");
-        } else if (strcmp(relay6->valuestring, "off") == 0) {
-            relay_off(GPIO_NUM_RELAY6);
-            ESP_LOGI(TAG, "Relay6 OFF");
-        }
-    }
-    // 继电器7
-    cJSON *relay7 = cJSON_GetObjectItemCaseSensitive(root, "relay7");
-    if (cJSON_IsString(relay7) && relay7->valuestring != NULL) {
-        if (strcmp(relay7->valuestring, "on") == 0) {
-            relay_on(GPIO_NUM_RELAY7);
-            ESP_LOGI(TAG, "Relay7 ON");
-        } else if (strcmp(relay7->valuestring, "off") == 0) {
-            relay_off(GPIO_NUM_RELAY7);
-            ESP_LOGI(TAG, "Relay7 OFF");
-        }
-    }
-    // 继电器8
-    cJSON *relay8 = cJSON_GetObjectItemCaseSensitive(root, "relay8");
-    if (cJSON_IsString(relay8) && relay8->valuestring != NULL) {
-        if (strcmp(relay8->valuestring, "on") == 0) {
-            relay_on(GPIO_NUM_RELAY8);
-            ESP_LOGI(TAG, "Relay8 ON");
-        } else if (strcmp(relay8->valuestring, "off") == 0) {
-            relay_off(GPIO_NUM_RELAY8);
-            ESP_LOGI(TAG, "Relay8 OFF");
+    /* ---- relay control: {"box1":"on"}, {"box2":"off"}, ... ---- */
+    for (int i = 1; i <= RELAY_COUNT; i++) {
+        char key[8];
+        snprintf(key, sizeof(key), "box%d", i);
+        cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+        if (cJSON_IsString(item) && item->valuestring) {
+            uint8_t cmd_on = (strcmp(item->valuestring, "on") == 0) ? 1 : 0;
+            relay_set(i, cmd_on);
+            vTaskDelay(pdMS_TO_TICKS(150));
+            uint8_t actual = gpio_get_level(relay_state_pins[i - 1]);
+            if (actual == cmd_on) {
+                ESP_LOGI(TAG, "Box%d %s [state OK]", i, cmd_on ? "ON" : "OFF");
+            } else {
+                ESP_LOGW(TAG, "Box%d %s [state MISMATCH: cmd=%d gpio=%d]", i,
+                         cmd_on ? "ON" : "OFF", cmd_on, actual);
+            }
         }
     }
 
-    // TTS语音播报
+/* ---- TTS speech ---- */
     cJSON *tts = cJSON_GetObjectItemCaseSensitive(root, "tts");
-    if (cJSON_IsString(tts) && tts->valuestring != NULL) {
+    if (cJSON_IsString(tts) && tts->valuestring) {
         tts_speak_async(tts->valuestring);
         ESP_LOGI(TAG, "TTS queued: %s", tts->valuestring);
     }
@@ -146,7 +75,9 @@ static void handle_mqtt_command(const mqtt_cmd_msg_t *msg)
     cJSON_Delete(root);
 }
 
-/* ---------- MQTT 事件回调 ---------- */
+/* ================================================================ */
+/*  MQTT event callback  -- enqueue only, no blocking                */
+/* ================================================================ */
 static void mqtt_event_callback(void *handler_args,
                                 esp_event_base_t base,
                                 int32_t event_id,
@@ -169,9 +100,11 @@ static void mqtt_event_callback(void *handler_args,
 
     case MQTT_EVENT_ERROR:
         if (data->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
-            ESP_LOGE(TAG, "Transport error: errno=%d", data->error_handle->esp_transport_sock_errno);
+            ESP_LOGE(TAG, "Transport error: errno=%d",
+                     data->error_handle->esp_transport_sock_errno);
         } else if (data->error_handle->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED) {
-            ESP_LOGE(TAG, "Connection refused code: %d", data->error_handle->connect_return_code);
+            ESP_LOGE(TAG, "Connection refused code: %d",
+                     data->error_handle->connect_return_code);
         }
         break;
 
@@ -179,15 +112,15 @@ static void mqtt_event_callback(void *handler_args,
         mqtt_cmd_msg_t cmd;
         memset(&cmd, 0, sizeof(cmd));
 
-        // 截断防止溢出
-        size_t topic_cpy_len = (data->topic_len >= sizeof(cmd.topic)) ? (sizeof(cmd.topic)-1) : data->topic_len;
-        memcpy(cmd.topic, data->topic, topic_cpy_len);
+        size_t tc = (data->topic_len >= sizeof(cmd.topic))
+                        ? (sizeof(cmd.topic) - 1) : data->topic_len;
+        memcpy(cmd.topic, data->topic, tc);
 
-        size_t data_cpy_len = (data->data_len >= sizeof(cmd.payload)) ? (sizeof(cmd.payload)-1) : data->data_len;
-        memcpy(cmd.payload, data->data, data_cpy_len);
+        size_t dc = (data->data_len >= sizeof(cmd.payload))
+                        ? (sizeof(cmd.payload) - 1) : data->data_len;
+        memcpy(cmd.payload, data->data, dc);
 
-        // 非阻塞入队，队列满直接丢弃指令，防止阻塞回调
-        xQueueSend(mqtt_cmd_queue, &cmd, 0);
+        xQueueSend(mqtt_cmd_queue, &cmd, pdMS_TO_TICKS(10));
         break;
     }
     default:
@@ -195,44 +128,46 @@ static void mqtt_event_callback(void *handler_args,
     }
 }
 
-/* ---------- 启动 MQTT ---------- */
+/* ================================================================ */
+/*  mqtt_start  -- create and connect MQTT client                    */
+/* ================================================================ */
 esp_err_t mqtt_start(void)
 {
-    if (mqtt_client != NULL) {
+    if (mqtt_client) {
         esp_mqtt_client_destroy(mqtt_client);
         mqtt_client = NULL;
         vTaskDelay(pdMS_TO_TICKS(200));
     }
 
-    const esp_mqtt_client_config_t mqtt_cfg = {
+    const esp_mqtt_client_config_t cfg = {
         .broker = {
-            .address.uri = MQTT_BROKER_URI,
+            .address.uri  = MQTT_BROKER_URI,
             .address.port = MQTT_BROKER_PORT,
         },
         .credentials = {
             .client_id = MQTT_CLIENT_ID,
-            .username = MQTT_USERNAME,
+            .username   = MQTT_USERNAME,
             .authentication.password = MQTT_PASSWORD,
         },
         .session = {
-            .keepalive = 60,
-            .disable_clean_session = false,
+            .keepalive              = 60,
+            .disable_clean_session  = false,
         },
         .network = {
-            .timeout_ms = 10000,
-            .reconnect_timeout_ms = 5000,
+            .timeout_ms             = 10000,
+            .reconnect_timeout_ms   = 5000,
             .disable_auto_reconnect = false,
         },
         .task = {
-            .priority = 5,
+            .priority   = 5,
             .stack_size = 8192,
         },
     };
 
-    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
-    esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_callback, NULL);
+    mqtt_client = esp_mqtt_client_init(&cfg);
+    esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID,
+                                   mqtt_event_callback, NULL);
     esp_err_t err = esp_mqtt_client_start(mqtt_client);
-
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "MQTT start failed: %s", esp_err_to_name(err));
         mqtt_client = NULL;
@@ -240,83 +175,82 @@ esp_err_t mqtt_start(void)
     return err;
 }
 
-/* ---------- 发布传感器数据 ---------- */
+/* ================================================================ */
+/*  publish_sensor_data  -- periodic status report                    */
+/* ================================================================ */
 static void publish_sensor_data(void)
 {
-    if (!mqtt_connected || mqtt_client == NULL) {
-        ESP_LOGW(TAG, "Not connected, skip publish");
-        return;
+    if (!mqtt_connected || !mqtt_client) return;
+
+    /* Build box states with loop */
+    char boxes[256];
+    int  pos = 0;
+    for (int i = 1; i <= RELAY_COUNT; i++) {
+        pos += snprintf(boxes + pos, sizeof(boxes) - pos,
+                        "\"box%d\":\"%s\"%s",
+                        i, box_state[i - 1] ? "on" : "off",
+                        (i < RELAY_COUNT) ? "," : "");
     }
 
-    static char json[256];
+    char json[512];
     int len = snprintf(json, sizeof(json),
-        "{\"timestamp\":%lu,\"device\":\"%s\","
-        "\"relay1\":\"%s\",\"relay2\":\"%s\",\"relay3\":\"%s\",\"relay4\":\"%s\","
-        "\"relay5\":\"%s\",\"relay6\":\"%s\",\"relay7\":\"%s\",\"relay8\":\"%s\","
-        "\"fw\":\"1.0.0\"}",
+        "{\"timestamp\":%lu,\"device\":\"%s\",%s,\"fw\":\"1.0.0\"}",
         (unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS),
-        MQTT_CLIENT_ID,
-        relay_state1 ? "on" : "off",
-        relay_state2 ? "on" : "off",
-        relay_state3 ? "on" : "off",
-        relay_state4 ? "on" : "off",
-        relay_state5 ? "on" : "off",
-        relay_state6 ? "on" : "off",
-        relay_state7 ? "on" : "off",
-        relay_state8 ? "on" : "off");
+        MQTT_CLIENT_ID, boxes);
 
     if (len > 0 && len < sizeof(json)) {
-        int msg_id = esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_SENSOR, json, 0, 0, 0);
-        if (msg_id < 0) {
+        int msg_id = esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_SENSOR,
+                                              json, 0, 0, 0);
+        if (msg_id < 0)
             ESP_LOGE(TAG, "Publish failed, msg_id=%d", msg_id);
-        } else {
+        else
             ESP_LOGD(TAG, "Published sensor data");
-        }
     }
 }
 
-/* ---------- MQTT主任务 ---------- */
-void mqtt_task(void *pvParameters)
+/* ================================================================ */
+/*  Tasks                                                             */
+/* ================================================================ */
+static void mqtt_listen_task(void *arg)
 {
-    // 创建指令队列
-    mqtt_cmd_queue = xQueueCreate(MQTT_CMD_QUEUE_LEN, sizeof(mqtt_cmd_msg_t));
-    if (mqtt_cmd_queue == NULL) {
-        ESP_LOGE(TAG, "Create mqtt cmd queue failed!");
-        vTaskDelete(NULL);
-    }
-
-    // 等待网络就绪
-    vTaskDelay(pdMS_TO_TICKS(5000));
-    mqtt_start();
-
-    mqtt_cmd_msg_t cmd_buf;
-
+    mqtt_cmd_msg_t cmd;
     while (1) {
-        // 连接成功后执行订阅
-        if (mqtt_connected && !has_subscribed && mqtt_client != NULL) {
+        if (xQueueReceive(mqtt_cmd_queue, &cmd, portMAX_DELAY) == pdPASS)
+            handle_mqtt_command(&cmd);
+    }
+}
+
+static void mqtt_publish_task(void *arg)
+{
+    while (1) {
+        if (mqtt_connected && !has_subscribed && mqtt_client) {
             esp_mqtt_client_subscribe_single(mqtt_client, MQTT_TOPIC_SENSOR, 0);
             esp_mqtt_client_subscribe_single(mqtt_client, MQTT_TOPIC_COMMAND, 1);
             has_subscribed = true;
-            ESP_LOGI(TAG, "Subscribe topics success");
+            ESP_LOGI(TAG, "Subscribed to topics");
         }
-
-        // 断线重连逻辑
         if (!mqtt_connected) {
             reconnect_attempts++;
-            ESP_LOGW(TAG, "MQTT reconnect attempt: %d", reconnect_attempts);
             int delay_ms = 1000 * (reconnect_attempts > 6 ? 6 : reconnect_attempts);
+            ESP_LOGW(TAG, "Reconnect attempt %d", reconnect_attempts);
             vTaskDelay(pdMS_TO_TICKS(delay_ms));
             mqtt_start();
             continue;
         }
-
-        // 处理收到的下发指令
-        if (xQueueReceive(mqtt_cmd_queue, &cmd_buf, pdMS_TO_TICKS(100)) == pdPASS) {
-            handle_mqtt_command(&cmd_buf);
-        }
-
-        // 定时上报传感器/继电器状态
         publish_sensor_data();
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(5000));
     }
+}
+
+void mqtt_task(void *arg)
+{
+    mqtt_cmd_queue = xQueueCreate(MQTT_CMD_QUEUE_LEN, sizeof(mqtt_cmd_msg_t));
+    if (mqtt_cmd_queue == NULL) {
+        ESP_LOGE(TAG, "Create mqtt cmd queue failed");
+        vTaskDelete(NULL);
+    }
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    xTaskCreate(mqtt_listen_task, "mqtt_listen", 8192, NULL, 5, NULL);
+    xTaskCreate(mqtt_publish_task, "mqtt_publish", 8192, NULL, 4, NULL);
+    vTaskDelete(NULL);
 }

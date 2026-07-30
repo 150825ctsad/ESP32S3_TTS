@@ -1,49 +1,77 @@
 #include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "relay.h"
 #include "driver/gpio.h"
 
-uint8_t relay_state1 = 0;
-uint8_t relay_state2 = 0;
-uint8_t relay_state3 = 0;
-uint8_t relay_state4 = 0;
-uint8_t relay_state5 = 0;
-uint8_t relay_state6 = 0;
-uint8_t relay_state7 = 0;
-uint8_t relay_state8 = 0;
+const uint8_t relay_ctrl_pins[RELAY_COUNT]  = {42, 41, 40, 39, 38, 37, 36, 35};
+const uint8_t relay_state_pins[RELAY_COUNT] = { 4,  5,  6,  7, 15, 16, 17, 18};
+uint8_t box_state[RELAY_COUNT] = {0};
 
+/* ---- Init control pins (output, all off) ---- */
 void relay_init(void)
 {
-    // 配置GPIO引脚
+    uint64_t mask = 0;
+    for (int i = 0; i < RELAY_COUNT; i++)
+        mask |= (1ULL << relay_ctrl_pins[i]);
+
     gpio_config_t conf = {
-        .mode = GPIO_MODE_OUTPUT,
-        .intr_type = GPIO_INTR_DISABLE,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .mode         = GPIO_MODE_OUTPUT,
+        .intr_type    = GPIO_INTR_DISABLE,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .pin_bit_mask = (1ULL << GPIO_NUM_RELAY1) | (1ULL << GPIO_NUM_RELAY2) | (1ULL << GPIO_NUM_RELAY3) | (1ULL << GPIO_NUM_RELAY4) | (1ULL << GPIO_NUM_RELAY5) | (1ULL << GPIO_NUM_RELAY6) | (1ULL << GPIO_NUM_RELAY7) | (1ULL << GPIO_NUM_RELAY8),
-       };
+        .pin_bit_mask = mask,
+    };
     gpio_config(&conf);
-    
-    // 初始状态设为关闭
-    relay_off(GPIO_NUM_RELAY1);
-    relay_off(GPIO_NUM_RELAY2);
-    relay_off(GPIO_NUM_RELAY3);
-    relay_off(GPIO_NUM_RELAY4);
-    relay_off(GPIO_NUM_RELAY5);
-    relay_off(GPIO_NUM_RELAY6);
-    relay_off(GPIO_NUM_RELAY7);
-    relay_off(GPIO_NUM_RELAY8);
+
+    for (int i = 0; i < RELAY_COUNT; i++)
+        relay_set(i + 1, 0);
 }
 
-void relay_on(uint8_t GPIO_NUM_RELAY)
+/* ---- Init state feedback pins (input) ---- */
+void relay_state_init(void)
 {
-    // 设置引脚为高电平（打开继电器）
-    gpio_set_level(GPIO_NUM_RELAY, 1);
-    relay_state1 = 1;
+    uint64_t mask = 0;
+    for (int i = 0; i < RELAY_COUNT; i++)
+        mask |= (1ULL << relay_state_pins[i]);
+
+    gpio_config_t conf = {
+        .mode         = GPIO_MODE_INPUT,
+        .intr_type    = GPIO_INTR_DISABLE,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .pin_bit_mask = mask,
+    };
+    gpio_config(&conf);
 }
 
-void relay_off(uint8_t GPIO_NUM_RELAY)
+/* ---- Control one box (1-indexed) ---- */
+void relay_set(uint8_t box, uint8_t on)
 {
-    // 设置引脚为低电平（关闭继电器）
-    gpio_set_level(GPIO_NUM_RELAY, 0);
-    relay_state1 = 0;
+    if (box < 1 || box > RELAY_COUNT) return;
+    uint8_t idx = box - 1;
+    gpio_set_level(relay_ctrl_pins[idx], on ? 1 : 0);
+    box_state[idx] = on ? 1 : 0;
+}
+
+/* ---- Read all 8 state pins, return bitmap ---- */
+uint8_t relay_read_states(void)
+{
+    uint8_t bitmap = 0;
+    for (int i = 0; i < RELAY_COUNT; i++) {
+        if (gpio_get_level(relay_state_pins[i]))
+            bitmap |= (1 << i);
+    }
+    return bitmap;
+}
+
+/* ---- FreeRTOS task: poll state pins, update box_state[] ---- */
+void relay_task(void *arg)
+{
+    while (1) {
+        uint8_t states = relay_read_states();
+        for (int i = 0; i < RELAY_COUNT; i++)
+            box_state[i] = (states >> i) & 1;
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
 }

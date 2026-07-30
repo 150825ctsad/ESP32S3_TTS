@@ -9,7 +9,6 @@
 #include "esp_tts.h"
 #include "esp_tts_voice_template.h"
 #include "esp_board_init.h"
-#include "ringbuf.h"
 #include "esp_partition.h"
 #include "esp_idf_version.h"
 
@@ -29,7 +28,6 @@
 /*  Globals                                                          */
 /* ================================================================ */
 static esp_tts_handle_t *tts_handle = NULL;
-ringbuf_handle_t urat_rb = NULL;          // used by TTS.c UART task
 static QueueHandle_t     tts_queue = NULL;
 
 /* ================================================================ */
@@ -115,51 +113,20 @@ static esp_err_t tts_init(void)
 }
 
 /* ================================================================ */
-/*  uart_input_task  -- reads UART lines, feeds to tts_speak_async   */
-/* ================================================================ */
-static void uart_input_task(void *arg)
-{
-    urat_rb = rb_create(URAT_BUF_LEN, 1);
-    xTaskCreatePinnedToCore(&uartTask, "urat", 6 * 1024, NULL, 5, NULL, 0);
-
-    char data[URAT_BUF_LEN + 1];
-    char in;
-    int  data_len = 0;
-
-    printf("\n请输入短语\n");
-    while (1) {
-        rb_read(urat_rb, &in, 1, portMAX_DELAY);
-
-        if (in == '\n') {
-            data[data_len] = '\0';
-            tts_speak_async(data);
-            printf("\n请输入短语\n");
-            data_len = 0;
-        } else if (data_len < URAT_BUF_LEN) {
-            data[data_len] = in;
-            data_len++;
-        } else {
-            printf("ERROR: text too long\n");
-            data_len = 0;
-        }
-    }
-}
-
-/* ================================================================ */
 /*  app_main  -- entry point: init everything, then let tasks run     */
 /* ================================================================ */
 int app_main()
 {
+    relay_state_init();
     relay_init();
     ESP_ERROR_CHECK(esp_board_init(16000, 1, 16));
 
     if (tts_init() != ESP_OK) return 0;
 
     wifi_init_sta();
-    xTaskCreatePinnedToCore(uart_input_task, "uart_in", 4 * 1024, NULL, 5, NULL, 0);
+    
+    xTaskCreatePinnedToCore(relay_task, "relay", 4 * 1024, NULL, 3, NULL, 1);
 
-    /* 非阻塞播报启动提示 —— TTS 任务已就绪 */
-    tts_speak_async("欢迎使用乐鑫语音合成");
 
     while(1){
         vTaskDelay(1000);
