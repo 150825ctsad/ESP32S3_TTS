@@ -123,7 +123,7 @@ int app_main()
 
     if (tts_init() != ESP_OK) return 0;
 
-    wifi_init_sta();
+    wifi_init();
     
     xTaskCreatePinnedToCore(relay_task, "relay", 4 * 1024, NULL, 3, NULL, 1);
 
