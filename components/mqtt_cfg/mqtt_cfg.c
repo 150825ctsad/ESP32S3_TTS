@@ -18,6 +18,7 @@
 #define MQTT_CLIENT_ID         "esp32s3"
 #define MQTT_USERNAME          "esp32s3"
 #define MQTT_PASSWORD          ""
+
 #define MQTT_TOPIC_SENSOR      "test/ESP-IDF/SENSOR_DATA"
 #define MQTT_TOPIC_COMMAND     "test/ESP-IDF/COMMAND"
 
@@ -65,7 +66,9 @@ static void handle_mqtt_command(const mqtt_cmd_msg_t *msg)
                 }
         ESP_LOGI(TAG,"Box%d trigger",i);
         box_trigger(i,1);
-
+        tts_speak_async("门已开请尽快取货");
+        vTaskDelay(pdMS_TO_TICKS(500));
+        tts_speak_async("取货后请关门");
 }
 
 /* ---- TTS speech ---- */
@@ -241,7 +244,7 @@ static void mqtt_publish_task(void *arg)
             continue;
         }
         publish_sensor_data();
-        vTaskDelay(pdMS_TO_TICKS(5000));
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 

@@ -6,8 +6,8 @@
 
 #define BOX_TRIGGER_TIME_MS 125
 
-const uint8_t relay_ctrl_pins[RELAY_COUNT]  = {42, 41, 40, 39, 38, 37, 36, 35};
-const uint8_t relay_state_pins[RELAY_COUNT] = { 4,  5,  6,  7, 15, 16, 17, 18};
+const uint8_t relay_ctrl_pins[RELAY_COUNT]  = {42, 41, 40, 39, 38, 37, 36, 35, 1 , 2};
+const uint8_t relay_state_pins[RELAY_COUNT] = { 4,  5,  6,  7, 15, 16, 17, 18, 19, 20};
 uint8_t box_state[RELAY_COUNT] = {0};
 
 /* ---- Init control pins (output, all off) ---- */
@@ -40,7 +40,7 @@ void relay_state_init(void)
     gpio_config_t conf = {
         .mode         = GPIO_MODE_INPUT,
         .intr_type    = GPIO_INTR_DISABLE,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .pin_bit_mask = mask,
     };
