@@ -6,6 +6,7 @@
 
                         REQUIRES 
                         relay
+                        button
                         wifi_cfg
                         TTS
                         sr_ringbuf 

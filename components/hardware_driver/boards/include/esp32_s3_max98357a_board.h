@@ -51,11 +51,11 @@
  * These are commonly-used ESP32-S3 pins. Adjust to match your wiring.
  */
 #define FUNC_I2S_EN         (1)
-#define GPIO_I2S_LRCK       (GPIO_NUM_16)   /* WS / word select */
+#define GPIO_I2S_LRCK       (GPIO_NUM_40)   /* WS / word select */
 #define GPIO_I2S_MCLK       (GPIO_NUM_NC)   /* MAX98357A has internal PLL, no MCLK needed */
-#define GPIO_I2S_SCLK       (GPIO_NUM_15)   /* BCLK / bit clock */
+#define GPIO_I2S_SCLK       (GPIO_NUM_41)   /* BCLK / bit clock */
 #define GPIO_I2S_SDIN       (GPIO_NUM_NC)   /* no microphone input */
-#define GPIO_I2S_DOUT       (GPIO_NUM_7)    /* DIN on MAX98357A */
+#define GPIO_I2S_DOUT       (GPIO_NUM_42)    /* DIN on MAX98357A */
 
 /**
  * @brief Secondary I2S - not used

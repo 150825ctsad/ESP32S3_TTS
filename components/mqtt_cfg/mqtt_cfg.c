@@ -3,6 +3,7 @@
 #include "mqtt_cfg.h"
 #include "mqtt_client.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "relay.h"
@@ -14,11 +15,13 @@
 #define MQTT_BROKER_URI        "mqtt://192.168.1.200"
 #define MQTT_BROKER_PORT       1883
 
-#define MQTT_CLIENT_ID         "esp32s3"
 #define MQTT_USERNAME          "esp32s3"
 #define MQTT_PASSWORD          ""
 #define MQTT_TOPIC_SENSOR      "test/ESP-IDF/SENSOR_DATA"
 #define MQTT_TOPIC_COMMAND     "test/ESP-IDF/COMMAND"
+
+/* 基于芯片 MAC 地址的唯一标识：完整 12 位十六进制 MAC */
+static char mqtt_client_id[13] = "000000000000";
 
 static esp_mqtt_client_handle_t mqtt_client = NULL;
 static bool mqtt_connected = false;
@@ -100,22 +103,22 @@ static void mqtt_event_callback(void *handler_args,
                 break;
             }
         
-            // 3. 解析并处理每个字段
-            // 3.1 继电器控制（relay: "on"/"off"）
-            cJSON *relay = cJSON_GetObjectItemCaseSensitive(root, "relay");
-            if (cJSON_IsString(relay) && relay->valuestring != NULL) {
-                if (strcmp(relay->valuestring, "on") == 0) {
-                    relay_on();
-                    ESP_LOGI(TAG, "Relay turned ON");
-                } else if (strcmp(relay->valuestring, "off") == 0) {
-                    relay_off();
-                    ESP_LOGI(TAG, "Relay turned OFF");
-                } else {
-                    ESP_LOGE(TAG, "Invalid relay value: %s (expected 'on' or 'off')", relay->valuestring);
-                }
-            } else {
-                ESP_LOGD(TAG, "No relay field in message");
-            }
+            // // 3. 解析并处理每个字段
+            // // 3.1 继电器控制（relay: "on"/"off"）
+            // cJSON *relay = cJSON_GetObjectItemCaseSensitive(root, "relay");
+            // if (cJSON_IsString(relay) && relay->valuestring != NULL) {
+            //     if (strcmp(relay->valuestring, "on") == 0) {
+            //         relay_on();
+            //         ESP_LOGI(TAG, "Relay turned ON");
+            //     } else if (strcmp(relay->valuestring, "off") == 0) {
+            //         relay_off();
+            //         ESP_LOGI(TAG, "Relay turned OFF");
+            //     } else {
+            //         ESP_LOGE(TAG, "Invalid relay value: %s (expected 'on' or 'off')", relay->valuestring);
+            //     }
+            // } else {
+            //     ESP_LOGD(TAG, "No relay field in message");
+            // }
             // 3.2 TTS 语音播报（tts: "文本内容"）
             cJSON *tts = cJSON_GetObjectItemCaseSensitive(root, "tts");
             if (cJSON_IsString(tts) && tts->valuestring != NULL) {
@@ -149,7 +152,7 @@ static void mqtt_start(void)
             .address.port = MQTT_BROKER_PORT,
         },
         .credentials = {
-            .client_id = MQTT_CLIENT_ID,
+            .client_id = mqtt_client_id,
             .username = MQTT_USERNAME,
             .authentication.password = MQTT_PASSWORD,
         },
@@ -189,11 +192,9 @@ static void publish_sensor_data(void)
     /*  构造 JSON（这里用整数/浮点均可） */
     static char json[256];
     int len = snprintf(json, sizeof(json),
-        "{\"timestamp\":%lu,\"relay\":\"%s\",\"device\":\"%s\",\"fw\":\"1.0.0\"}",
+        "{\"timestamp\":%lu,\"device\":\"%s\"}",
         
-        (unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS),
-        (relay_state == 0 ? "off" : "on"),
-        MQTT_CLIENT_ID);
+        (unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS),mqtt_client_id);
 
     if (len > 0 && len < sizeof(json)) {
         int msg_id = esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_SENSOR, json, 0, 0, 0);
@@ -211,6 +212,15 @@ static void publish_sensor_data(void)
 /* ---------- 主任务 ---------- */
 void mqtt_task(void *pvParameters)
 {
+    /* 基于芯片 MAC 生成唯一 client_id：完整 MAC 地址 */
+    uint8_t mac[6];
+    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
+        snprintf(mqtt_client_id, sizeof(mqtt_client_id),
+                 "%02x%02x%02x%02x%02x%02x",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    }
+    ESP_LOGI(TAG, "Client ID: %s", mqtt_client_id);
+
     // 等待网络连接
     vTaskDelay(pdMS_TO_TICKS(5000));
     
@@ -230,8 +240,8 @@ void mqtt_task(void *pvParameters)
             continue;
         }
 
-        /* 每 5 秒发布一次数据 */
+        /* 每 10 秒发布一次数据 */
         publish_sensor_data();
-        vTaskDelay(pdMS_TO_TICKS(5000));
+        vTaskDelay(pdMS_TO_TICKS(10000));
     }
 }

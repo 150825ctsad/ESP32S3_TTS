@@ -4,16 +4,17 @@
   "idf.openOcdConfigs": [
     "board/esp32s3-builtin.cfg"
   ],
-  "idf.currentSetup": "D:\\.espressif\\v5.5.5\\esp-idf",
+  "idf.currentSetup": "D:/Espressif/frameworks/esp-idf-v5.5.4/",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
   },
-  "clangd.path": "C:\\Espressif\\tools\\esp-clang\\esp-19.1.2_20250312\\esp-clang\\bin\\clangd.exe",
+  "clangd.path": "D:\\Espressif\\tools\\esp-clang\\esp-19.1.2_20250312\\esp-clang\\bin\\clangd.exe",
   "clangd.arguments": [
     "--background-index",
     "--query-driver=**",
-    "--compile-commands-dir=d:\\code\\TTS\\build"
+    "--compile-commands-dir=${workspaceFolder}/build"
   ],
-  "idf.portWin": "COM4",
-  "idf.flashType": "UART"
+  "idf.portWin": "COM13",
+  "idf.flashType": "UART",
+  "idf.flashBaudRate": "921600"
 }
