@@ -40,6 +40,27 @@ static esp_tts_handle_t *tts_handle = NULL;
 static QueueHandle_t     tts_queue = NULL;
 
 /* ================================================================ */
+/*  Fade in/out -- 消除每段语音首尾的咔哒爆音 (8ms @16kHz)           */
+/* ================================================================ */
+#define TTS_FADE_SAMPLES   128
+
+static void fade_in(int16_t *pcm, int n)
+{
+    int f = n < TTS_FADE_SAMPLES ? n : TTS_FADE_SAMPLES;
+    for (int i = 0; i < f; i++)
+        pcm[i] = (int16_t)((int32_t)pcm[i] * i / f);
+}
+
+static void fade_out(int16_t *pcm, int n)
+{
+    int f = n < TTS_FADE_SAMPLES ? n : TTS_FADE_SAMPLES;
+    for (int i = 0; i < f; i++) {
+        int idx = n - f + i;
+        pcm[idx] = (int16_t)((int32_t)pcm[idx] * (f - i) / f);
+    }
+}
+
+/* ================================================================ */
 /*  tts_speak  -- synchronous playback                               */
 /* ================================================================ */
 static void tts_speak(const char *text)
@@ -50,15 +71,49 @@ static void tts_speak(const char *text)
     if (esp_tts_parse_chinese(tts_handle, text)) {
         int total_bytes = 0;
         int len[1] = {0};
-        do {
+        int16_t *tail = NULL;      /* 缓存最近一块：仅最后一块需要淡出 */
+        int tail_len = 0;
+        bool first = true;
+
+        while (1) {
             short *pcm = esp_tts_stream_play(tts_handle, len, TTS_SPEECH_SPEED);
             if (pcm == NULL || len[0] <= 0) break;
-            int bytes = len[0] * (int)sizeof(short);
-            esp_err_t ret = esp_audio_play(pcm, bytes, portMAX_DELAY);
+
+            /* 上一块不是结尾，直接写出 */
+            if (tail_len > 0) {
+                esp_err_t ret = esp_audio_play(tail, tail_len * (int)sizeof(short), portMAX_DELAY);
+                if (ret != ESP_OK) printf("TTS: write err %d at %d bytes\n", ret, total_bytes);
+                total_bytes += tail_len * (int)sizeof(short);
+            }
+
+            /* stream_play 的内部缓冲下次调用即失效，必须拷贝 */
+            int16_t *tmp = realloc(tail, len[0] * sizeof(short));
+            if (tmp == NULL) {       /* 内存不足则放弃淡出，直接写当前块 */
+                esp_audio_play(pcm, len[0] * (int)sizeof(short), portMAX_DELAY);
+                total_bytes += len[0] * (int)sizeof(short);
+                tail_len = 0;
+                first = false;
+                continue;
+            }
+            tail = tmp;
+            memcpy(tail, pcm, len[0] * sizeof(short));
+            tail_len = len[0];
+
+            if (first) {
+                fade_in(tail, tail_len);
+                first = false;
+            }
+        }
+
+        /* 缓存的最后一块做淡出后写出 */
+        if (tail_len > 0) {
+            fade_out(tail, tail_len);
+            esp_err_t ret = esp_audio_play(tail, tail_len * (int)sizeof(short), portMAX_DELAY);
             if (ret != ESP_OK) printf("TTS: write err %d at %d bytes\n", ret, total_bytes);
-            total_bytes += bytes;
-        } while (len[0] > 0);
-        printf("TTS: wrote %d bytes total, sample[0]=%d\n", total_bytes, total_bytes > 0 ? 1 : 0);
+            total_bytes += tail_len * (int)sizeof(short);
+        }
+        free(tail);
+        printf("TTS: wrote %d bytes (%d ms)\n", total_bytes, total_bytes / 2 / 16);
     } else {
         printf("TTS: parse failed!\n");
     }
@@ -128,79 +183,4 @@ esp_err_t tts_init(void)
     xTaskCreatePinnedToCore(tts_task, "tts_task", 8 * 1024, NULL, 5, NULL, 1);
 
     return ESP_OK;
-}
-
-/* ================================================================ */
-/*  UART input task  -- reads lines from UART, feeds to TTS          */
-/* ================================================================ */
-void uartTask(void *arg)
-{
-    uart_config_t uart_config = {
-        .baud_rate = 115200,
-        .data_bits = UART_DATA_8_BITS,
-        .parity    = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
-        .source_clk = UART_SCLK_DEFAULT,
-#endif
-    };
-    uart_param_config(UART_NUM_0, &uart_config);
-    uart_driver_install(UART_NUM_0, 2 * URAT_BUF_LEN, 0, 0, NULL, 0);
-    char data[URAT_BUF_LEN];
-    int len = 0;
-
-    printf("\n请输入短语\n");
-    while (1) {
-        int fd;
-        if ((fd = open("/dev/uart/0", O_RDWR)) == -1) {
-            ESP_LOGE(TAG, "Cannot open UART");
-            vTaskDelay(5000 / portTICK_PERIOD_MS);
-            continue;
-        }
-        uart_vfs_dev_use_driver(0);
-
-        while (1) {
-            int s;
-            fd_set rfds;
-            struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
-            FD_ZERO(&rfds);
-            FD_SET(fd, &rfds);
-
-            s = select(fd + 1, &rfds, NULL, NULL, &tv);
-            if (s < 0) {
-                ESP_LOGE(TAG, "Select failed: errno %d", errno);
-                break;
-            } else if (s == 0) {
-                continue;
-            } else {
-                if (FD_ISSET(fd, &rfds)) {
-                    char buf;
-                    if (read(fd, &buf, 1) > 0) {
-                        if (buf == '\n') {
-                            data[len] = '\0';
-                            printf("uart input: %s\n", data);
-                            tts_speak_async(data);
-                            printf("\n请输入短语\n");
-                            len = 0;
-                        } else if (len < URAT_BUF_LEN) {
-                            data[len] = buf;
-                            len++;
-                        } else {
-                            printf("ERROR: text too long\n");
-                            len = 0;
-                        }
-                    } else {
-                        ESP_LOGE(TAG, "UART read error");
-                        break;
-                    }
-                } else {
-                    ESP_LOGE(TAG, "No FD set in select()");
-                    break;
-                }
-            }
-        }
-        close(fd);
-    }
-    vTaskDelete(NULL);
 }

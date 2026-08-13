@@ -1,6 +1,6 @@
 # 中文语言合成示例 
 
-本示例主要用于展示乐鑫中文语音合成库的使用方法。示例可通过URAT串口输入中文文本，回车后播放合成的语音数据。
+c
 参考`components/esp-tts` 目录下的 [README.md](https://github.com/espressif/esp-sr/blob/release/v1.0/esp-tts/README.md) 来获取更多有关乐鑫中文语言合成库的信息。
 
 

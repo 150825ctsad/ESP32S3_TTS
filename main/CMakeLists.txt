@@ -5,6 +5,7 @@
                         "."
 
                         REQUIRES 
+                        button
                         relay
                         wifi_cfg
                         TTS

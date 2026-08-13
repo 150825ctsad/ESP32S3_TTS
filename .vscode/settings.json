@@ -15,5 +15,6 @@
     "--compile-commands-dir=d:\\code\\TTS\\build"
   ],
   "idf.portWin": "COM4",
-  "idf.flashType": "UART"
+  "idf.flashType": "UART",
+  "idf.flashBaudRate": "921600"
 }
