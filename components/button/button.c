@@ -97,12 +97,12 @@ void button_init(void)
     gpio_config_t conf = {
         .mode         = GPIO_MODE_INPUT,
         .intr_type    = GPIO_INTR_DISABLE,
-        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .pin_bit_mask = (1ULL << GPIO_BTN_VOL_UP) | (1ULL << GPIO_BTN_VOL_DOWN),
     };
     gpio_config(&conf);
 
-    xTaskCreatePinnedToCore(button_task, "button", 2 * 1024, NULL, 4, NULL, 0);
+    xTaskCreatePinnedToCore(button_task, "button", 4 * 1024, NULL, 4, NULL, 0);
     ESP_LOGI(TAG, "Button init: VOL_UP=GPIO%d, VOL_DOWN=GPIO%d", GPIO_BTN_VOL_UP, GPIO_BTN_VOL_DOWN);
 }

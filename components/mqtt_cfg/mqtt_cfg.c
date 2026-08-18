@@ -8,7 +8,6 @@
 #include "freertos/task.h"
 #include "relay.h"
 #include "TTS.h"
-#include "mbedtls/base64.h"
 #include "cJSON.h"
 
 #define TAG                    "MQTT_CLIENT"
@@ -17,14 +16,17 @@
 
 #define MQTT_USERNAME          "esp32s3"
 #define MQTT_PASSWORD          ""
-#define MQTT_TOPIC_SENSOR      "test/ESP-IDF/SENSOR_DATA"
-#define MQTT_TOPIC_COMMAND     "test/ESP-IDF/COMMAND"
+#define MQTT_MAX_PAYLOAD       2048    /* 限制单条消息最大长度，防止 OOM */
 
 /* 基于芯片 MAC 地址的唯一标识：完整 12 位十六进制 MAC */
 static char mqtt_client_id[13] = "000000000000";
+/* 设备专属主题：cmd/<mac> 和 data/<mac>，避免多设备互相干扰 */
+static char mqtt_topic_cmd[24];       /* "cmd/b81f3fb86280" */
+static char mqtt_topic_data[24];      /* "data/b81f3fb86280" */
+static char mqtt_topic_audio[24];     /* "audio/b81f3fb86280" */
 
 static esp_mqtt_client_handle_t mqtt_client = NULL;
-static bool mqtt_connected = false;
+static volatile bool mqtt_connected = false;  /* 跨任务访问，加 volatile */
 static int reconnect_attempts = 0;
 
 /* ---------- MQTT 事件回调 ---------- */
@@ -37,11 +39,11 @@ static void mqtt_event_callback(void *handler_args,
 
     switch (event_id) {
     case MQTT_EVENT_CONNECTED:
-        esp_mqtt_client_subscribe_single(mqtt_client, MQTT_TOPIC_SENSOR, 0);
-        esp_mqtt_client_subscribe_single(mqtt_client, MQTT_TOPIC_COMMAND, 1);
-        ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+        /* 订阅设备专属指令主题：cmd/<mac> */
+        esp_mqtt_client_subscribe_single(mqtt_client, mqtt_topic_cmd, 1);
+        ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED, subscribed: %s", mqtt_topic_cmd);
         mqtt_connected = true;
-        reconnect_attempts = 0; // 重置重连尝试计数
+        reconnect_attempts = 0;
         break;
 
     case MQTT_EVENT_DISCONNECTED:
@@ -50,6 +52,10 @@ static void mqtt_event_callback(void *handler_args,
         break;
 
     case MQTT_EVENT_ERROR:
+        if (data->error_handle == NULL) {
+            ESP_LOGE(TAG, "MQTT error (no error_handle)");
+            break;
+        }
         if (data->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
             ESP_LOGE(TAG, "Transport error: errno=%d", data->error_handle->esp_transport_sock_errno);
         } else if (data->error_handle->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED) {
@@ -83,6 +89,12 @@ static void mqtt_event_callback(void *handler_args,
             ESP_LOGI(TAG, "Received message on topic: %.*s", data->topic_len, data->topic);
             ESP_LOGI(TAG, "Message content: %.*s", data->data_len, data->data);
         
+            /* 限制 payload 长度，防止恶意大包耗尽堆内存 */
+            if (data->data_len > MQTT_MAX_PAYLOAD) {
+                ESP_LOGW(TAG, "Payload too large (%d > %d), discarded", data->data_len, MQTT_MAX_PAYLOAD);
+                break;
+            }
+
             // 1. 转换消息为字符串（添加终止符）
             char *msg_str = (char *)malloc(data->data_len + 1);
             if (msg_str == NULL) {
@@ -139,11 +151,9 @@ static void mqtt_event_callback(void *handler_args,
 /* ---------- 启动 MQTT ---------- */
 static void mqtt_start(void)
 {
-    // 如果已有客户端实例，先销毁它
+    /* 已有客户端则不重复创建，依赖 ESP-MQTT 内部自动重连 */
     if (mqtt_client != NULL) {
-        esp_mqtt_client_destroy(mqtt_client);
-        mqtt_client = NULL;
-        vTaskDelay(pdMS_TO_TICKS(1000)); // 等待资源释放
+        return;
     }
 
     const esp_mqtt_client_config_t mqtt_cfg = {
@@ -157,26 +167,31 @@ static void mqtt_start(void)
             .authentication.password = MQTT_PASSWORD,
         },
         .session = {
-            .keepalive = 60, // 减少心跳间隔
+            .keepalive = 60,
             .disable_clean_session = false,
         },
         .network = {
             .timeout_ms = 10000,
             .reconnect_timeout_ms = 5000,
-            .disable_auto_reconnect = false, // 启用自动重连
+            .disable_auto_reconnect = false,   /* 启用自动重连 */
         },
         .task = {
             .priority = 5,
-            .stack_size = 8192, // 增加栈大小
+            .stack_size = 8192,
         },
     };
 
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    if (mqtt_client == NULL) {
+        ESP_LOGE(TAG, "MQTT client init failed (NULL)");
+        return;
+    }
     esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_callback, NULL);
     esp_err_t err = esp_mqtt_client_start(mqtt_client);
-    
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "MQTT start failed: %s", esp_err_to_name(err));
+        esp_mqtt_client_destroy(mqtt_client);
+        mqtt_client = NULL;
     }
 }
 
@@ -197,7 +212,7 @@ static void publish_sensor_data(void)
         (unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS),mqtt_client_id);
 
     if (len > 0 && len < sizeof(json)) {
-        int msg_id = esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_SENSOR, json, 0, 0, 0);
+        int msg_id = esp_mqtt_client_publish(mqtt_client, mqtt_topic_data, json, 0, 0, 0);
         if (msg_id < 0) 
         {
             ESP_LOGE(TAG, "Publish failed: %d", msg_id);
@@ -212,14 +227,21 @@ static void publish_sensor_data(void)
 /* ---------- 主任务 ---------- */
 void mqtt_task(void *pvParameters)
 {
-    /* 基于芯片 MAC 生成唯一 client_id：完整 MAC 地址 */
+    /* 基于芯片 MAC 生成唯一 client_id 和设备专属主题 */
     uint8_t mac[6];
     if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
         snprintf(mqtt_client_id, sizeof(mqtt_client_id),
                  "%02x%02x%02x%02x%02x%02x",
                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     }
-    ESP_LOGI(TAG, "Client ID: %s", mqtt_client_id);
+    /* cmd/<mac>  —— 下行指令主题（设备订阅） */
+    /* data/<mac> —— 上行数据主题（设备发布） */
+    /* audio/<mac> —— 上行音频主题（设备发布 Base64 PCM） */
+    snprintf(mqtt_topic_cmd,   sizeof(mqtt_topic_cmd),   "cmd/%s",   mqtt_client_id);
+    snprintf(mqtt_topic_data,  sizeof(mqtt_topic_data),  "data/%s",  mqtt_client_id);
+    snprintf(mqtt_topic_audio, sizeof(mqtt_topic_audio), "audio/%s", mqtt_client_id);
+    ESP_LOGI(TAG, "Client ID: %s | cmd: %s | data: %s | audio: %s",
+             mqtt_client_id, mqtt_topic_cmd, mqtt_topic_data, mqtt_topic_audio);
 
     // 等待网络连接
     vTaskDelay(pdMS_TO_TICKS(5000));
@@ -227,21 +249,27 @@ void mqtt_task(void *pvParameters)
     mqtt_start();
 
     while (1) {
-        /* 未连接就重连 */
-        if (!mqtt_connected) {
-            reconnect_attempts++;
-            ESP_LOGW(TAG, "MQTT reconnecting... (attempt %d)", reconnect_attempts);
-            
-            // 指数退避策略
-            int delay_ms = 1000 * (1 << (reconnect_attempts > 6 ? 6 : reconnect_attempts));
-            vTaskDelay(pdMS_TO_TICKS(delay_ms));
-            
-            mqtt_start();
-            continue;
+        /* 自动重连由 ESP-MQTT 内部处理，这里只负责发布数据 */
+        if (mqtt_connected) {
+            publish_sensor_data();
         }
-
-        /* 每 10 秒发布一次数据 */
-        publish_sensor_data();
         vTaskDelay(pdMS_TO_TICKS(10000));
+    }
+}
+
+/* ---------- 发布音频数据（Base64 PCM） ---------- */
+void mqtt_publish_audio(const char *b64_data, size_t b64_len)
+{
+    if (!mqtt_connected || mqtt_client == NULL) {
+        ESP_LOGW(TAG, "Not connected, audio discarded");
+        return;
+    }
+    /* QoS 0，不保留，音频是实时流数据 */
+    int msg_id = esp_mqtt_client_publish(mqtt_client, mqtt_topic_audio,
+                                          b64_data, (int)b64_len, 0, 0);
+    if (msg_id < 0) {
+        ESP_LOGE(TAG, "Audio publish failed: %d", msg_id);
+    } else {
+        ESP_LOGI(TAG, "Audio published: %d bytes (b64)", (int)b64_len);
     }
 }

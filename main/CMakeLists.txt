@@ -10,4 +10,5 @@
                         wifi_cfg
                         TTS
                         sr_ringbuf 
-                        hardware_driver)
+                        hardware_driver
+                        recorder)

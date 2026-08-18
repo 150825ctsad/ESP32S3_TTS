@@ -88,9 +88,12 @@ static void tts_speak(const char *text)
 
             /* stream_play 的内部缓冲下次调用即失效，必须拷贝 */
             int16_t *tmp = realloc(tail, len[0] * sizeof(short));
-            if (tmp == NULL) {       /* 内存不足则放弃淡出，直接写当前块 */
-                esp_audio_play(pcm, len[0] * (int)sizeof(short), portMAX_DELAY);
-                total_bytes += len[0] * (int)sizeof(short);
+            if (tmp == NULL) {       /* 内存不足：拷贝到栈缓冲再播放，避免写只读内部缓冲 */
+                static int16_t fallback[1024];
+                int copy_n = len[0] < 1024 ? len[0] : 1024;
+                memcpy(fallback, pcm, copy_n * sizeof(short));
+                esp_audio_play(fallback, copy_n * (int)sizeof(short), portMAX_DELAY);
+                total_bytes += copy_n * (int)sizeof(short);
                 tail_len = 0;
                 first = false;
                 continue;
@@ -146,7 +149,9 @@ void tts_speak_async(const char *text)
     char buf[TTS_TEXT_MAX + 1];
     strncpy(buf, text, TTS_TEXT_MAX);
     buf[TTS_TEXT_MAX] = '\0';
-    xQueueSend(tts_queue, buf, 0);
+    if (xQueueSend(tts_queue, buf, 0) != pdTRUE) {
+        printf("TTS: queue full, message dropped\n");
+    }
 }
 
 /* ---- one-time init: load voice, create queue + task ---- */
@@ -185,77 +190,3 @@ esp_err_t tts_init(void)
     return ESP_OK;
 }
 
-/* ================================================================ */
-/*  UART input task  -- reads lines from UART, feeds to TTS          */
-/* ================================================================ */
-void uartTask(void *arg)
-{
-    uart_config_t uart_config = {
-        .baud_rate = 115200,
-        .data_bits = UART_DATA_8_BITS,
-        .parity    = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
-        .source_clk = UART_SCLK_DEFAULT,
-#endif
-    };
-    uart_param_config(UART_NUM_0, &uart_config);
-    uart_driver_install(UART_NUM_0, 2 * URAT_BUF_LEN, 0, 0, NULL, 0);
-    char data[URAT_BUF_LEN];
-    int len = 0;
-
-    printf("\n请输入短语\n");
-    while (1) {
-        int fd;
-        if ((fd = open("/dev/uart/0", O_RDWR)) == -1) {
-            ESP_LOGE(TAG, "Cannot open UART");
-            vTaskDelay(5000 / portTICK_PERIOD_MS);
-            continue;
-        }
-        uart_vfs_dev_use_driver(0);
-
-        while (1) {
-            int s;
-            fd_set rfds;
-            struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
-            FD_ZERO(&rfds);
-            FD_SET(fd, &rfds);
-
-            s = select(fd + 1, &rfds, NULL, NULL, &tv);
-            if (s < 0) {
-                ESP_LOGE(TAG, "Select failed: errno %d", errno);
-                break;
-            } else if (s == 0) {
-                continue;
-            } else {
-                if (FD_ISSET(fd, &rfds)) {
-                    char buf;
-                    if (read(fd, &buf, 1) > 0) {
-                        if (buf == '\n') {
-                            data[len] = '\0';
-                            printf("uart input: %s\n", data);
-                            tts_speak_async(data);
-                            printf("\n请输入短语\n");
-                            len = 0;
-                        } else if (len < URAT_BUF_LEN) {
-                            data[len] = buf;
-                            len++;
-                        } else {
-                            printf("ERROR: text too long\n");
-                            len = 0;
-                        }
-                    } else {
-                        ESP_LOGE(TAG, "UART read error");
-                        break;
-                    }
-                } else {
-                    ESP_LOGE(TAG, "No FD set in select()");
-                    break;
-                }
-            }
-        }
-        close(fd);
-    }
-    vTaskDelete(NULL);
-}

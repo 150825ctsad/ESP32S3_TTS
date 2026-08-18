@@ -13,6 +13,7 @@
 #include "wifi_cfg.h"
 #include "relay.h"
 #include "button.h"
+#include "recorder.h"
 
 // /* Quick 1 kHz test tone — purely I2S path verification, no TTS */
 // static void test_beep(void)
@@ -37,20 +38,20 @@ int app_main()
     //relay_init();
     ESP_ERROR_CHECK(esp_board_init(16000, 1, 16));
 
-    button_init();  /* GPIO4=音量+, GPIO5=音量- */
+    button_init();
     vTaskDelay(1000);
 
-    //test_beep();  /* ← direct I2S test (bypasses TTS) */
+//   test_beep();  /* ← 临时启用：1kHz 测试音，绕过 TTS，验证 I2S/功放 */
 
     if (tts_init() != ESP_OK) return 0;
 
+    recorder_init();  /* VAD 触发录音 + MQTT 上传 */
+
     wifi_init();
     vTaskDelay(1000);
-    xTaskCreatePinnedToCore(uartTask, "uart_in", 4 * 1024, NULL, 5, NULL, 0);
 
     /* 非阻塞播报启动提示 —— TTS 任务已就绪 */
     tts_speak_async("欢迎使用乐鑫语音合成");
-    vTaskDelay(1000);
 
     while(1){
         vTaskDelay(1000);

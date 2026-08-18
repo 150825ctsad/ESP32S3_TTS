@@ -78,6 +78,7 @@ extern const char done_html_end[]     asm("_binary_done_html_end");
 static SemaphoreHandle_t s_ip_sem = NULL;
 static httpd_handle_t    s_httpd  = NULL;
 static volatile bool     s_connecting = false;  /* guard against duplicate /submit */
+static bool              s_mqtt_started = false; /* 防止重复创建 MQTT 任务 */
 
 /* ================================================================ */
 /*  tiny helpers                                                     */
@@ -173,17 +174,24 @@ static esp_err_t nvs_saved_push_front(const char *ssid, const char *pass,
     /* shift existing entries backwards (drop last if at capacity) */
     int start = (n >= MAX_SAVED) ? MAX_SAVED - 1 : n;
     for (int i = start; i > 0; i--) {
-        char k1[16], k2[16], k3[16];
-        snprintf(k1, sizeof(k1), NVS_KEY_SSID_FMT, i);
-        snprintf(k2, sizeof(k2), NVS_KEY_PASS_FMT, i);
-        snprintf(k3, sizeof(k3), NVS_KEY_BSSID_FMT, i);
-        size_t len = 64; char buf[64];
-        if (nvs_get_str(h, k1, buf, &len) == ESP_OK) nvs_set_str(h, k1, buf);
-        len = 64;
-        if (nvs_get_str(h, k2, buf, &len) == ESP_OK) nvs_set_str(h, k2, buf);
-        len = 6;
+        char k_dst[16], k_src[16], buf[128];
+        size_t len;
+        /* SSID: 从 i-1 读取，写入 i */
+        snprintf(k_src, sizeof(k_src), NVS_KEY_SSID_FMT, i - 1);
+        snprintf(k_dst, sizeof(k_dst), NVS_KEY_SSID_FMT, i);
+        len = sizeof(buf);
+        if (nvs_get_str(h, k_src, buf, &len) == ESP_OK) nvs_set_str(h, k_dst, buf);
+        /* password */
+        snprintf(k_src, sizeof(k_src), NVS_KEY_PASS_FMT, i - 1);
+        snprintf(k_dst, sizeof(k_dst), NVS_KEY_PASS_FMT, i);
+        len = sizeof(buf);
+        if (nvs_get_str(h, k_src, buf, &len) == ESP_OK) nvs_set_str(h, k_dst, buf);
+        /* bssid */
+        snprintf(k_src, sizeof(k_src), NVS_KEY_BSSID_FMT, i - 1);
+        snprintf(k_dst, sizeof(k_dst), NVS_KEY_BSSID_FMT, i);
         uint8_t b[6];
-        if (nvs_get_blob(h, k3, b, &len) == ESP_OK) nvs_set_blob(h, k3, b, 6);
+        len = 6;
+        if (nvs_get_blob(h, k_src, b, &len) == ESP_OK) nvs_set_blob(h, k_dst, b, 6);
     }
     /* write new entry at index 0 */
     char key[16];
@@ -306,10 +314,12 @@ static void dns_task(void *arg)
         struct sockaddr_in cl; socklen_t cll = sizeof(cl);
         int rl = recvfrom(s, rx, sizeof(rx), 0, (struct sockaddr*)&cl, &cll);
         if (rl < 12) continue;
+        int ql = rl - 12;
+        /* 边界检查：确保响应包不会溢出 tx 缓冲区 */
+        if (ql <= 0 || 12 + ql + 16 > sizeof(tx)) continue;
         memset(tx, 0, sizeof(tx));
         memcpy(tx, rx, 2);
         tx[2]=0x81; tx[3]=0x80; tx[4]=0; tx[5]=1; tx[6]=0; tx[7]=1;
-        int ql = rl - 12;
         memcpy(tx+12, rx+12, ql);
         int off = 12 + ql;
         tx[off+0]=0xC0; tx[off+1]=0x0C; tx[off+2]=0; tx[off+3]=1;
@@ -614,7 +624,11 @@ static void ev_handler(void *arg, esp_event_base_t base,
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&ev->ip_info.ip));
         if (s_ip_sem) xSemaphoreGive(s_ip_sem);
-        xTaskCreatePinnedToCore(mqtt_task, "mqtt_task", 4096, NULL, 5, NULL, 1);
+        /* 只在首次获取 IP 时创建 MQTT 任务，避免 WiFi 重连导致重复创建 */
+        if (!s_mqtt_started) {
+            s_mqtt_started = true;
+            xTaskCreatePinnedToCore(mqtt_task, "mqtt_task", 6144, NULL, 5, NULL, 1);
+        }
     }
 }
 
