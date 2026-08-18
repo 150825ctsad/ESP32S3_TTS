@@ -8,7 +8,8 @@
  *   GET  /saved/list        → ["ssid1","ssid2",…]
  *   GET  /saved/delete?index=N
  *   GET  /saved/set_default?index=N
- *   GET  /done.html         → success page
+ *   GET  /done.html         → success page (then POST /exit)
+ *   POST /exit              → stop AP/HTTP/DNS, connect STA (no reboot)
  *   GET  /advanced/config   → advanced settings JSON
  *   POST /advanced/submit   → save advanced config
  *   404                     → 302 redirect to /
@@ -78,7 +79,21 @@ extern const char done_html_end[]     asm("_binary_done_html_end");
 static SemaphoreHandle_t s_ip_sem = NULL;
 static httpd_handle_t    s_httpd  = NULL;
 static volatile bool     s_connecting = false;  /* guard against duplicate /submit */
+static volatile bool     s_provisioning = false; /* SoftAP portal active */
+static volatile bool     s_exiting = false;      /* guard against duplicate /exit */
 static bool              s_mqtt_started = false; /* 防止重复创建 MQTT 任务 */
+static volatile bool     s_dns_running = false;
+static int               s_dns_fd = -1;
+static TaskHandle_t      s_dns_task = NULL;
+
+static bool sta_try(const char *ssid, const char *pass, const uint8_t *bssid);
+static void build_ap_config(wifi_config_t *apc, char *ssid_out, size_t ssid_sz);
+static void start_provisioning(void);
+static void dns_start(void);
+static void dns_stop(void);
+static void http_start(void);
+static void http_stop(void);
+static void exit_config_task(void *arg);
 
 /* ================================================================ */
 /*  tiny helpers                                                     */
@@ -306,13 +321,30 @@ static void nvs_adv_set_u8(const char *key, uint8_t v)
 static void dns_task(void *arg)
 {
     int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (s < 0) { vTaskDelete(NULL); return; }
+    if (s < 0) {
+        s_dns_running = false;
+        s_dns_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
     struct sockaddr_in a = {.sin_family=AF_INET,.sin_port=htons(DNS_PORT),.sin_addr.s_addr=htonl(INADDR_ANY)};
-    bind(s, (struct sockaddr*)&a, sizeof(a));
+    if (bind(s, (struct sockaddr*)&a, sizeof(a)) < 0) {
+        ESP_LOGE(TAG, "DNS bind failed");
+        close(s);
+        s_dns_running = false;
+        s_dns_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+    s_dns_fd = s;
     char rx[DNS_BUF_LEN], tx[DNS_BUF_LEN];
-    while (1) {
+    while (s_dns_running) {
         struct sockaddr_in cl; socklen_t cll = sizeof(cl);
         int rl = recvfrom(s, rx, sizeof(rx), 0, (struct sockaddr*)&cl, &cll);
+        if (rl < 0) {
+            if (!s_dns_running) break;
+            continue;
+        }
         if (rl < 12) continue;
         int ql = rl - 12;
         /* 边界检查：确保响应包不会溢出 tx 缓冲区 */
@@ -327,15 +359,33 @@ static void dns_task(void *arg)
         tx[off+10]=0; tx[off+11]=4; tx[off+12]=192; tx[off+13]=168; tx[off+14]=4; tx[off+15]=1;
         sendto(s, tx, off+16, 0, (struct sockaddr*)&cl, cll);
     }
+    if (s_dns_fd >= 0) {
+        close(s_dns_fd);
+        s_dns_fd = -1;
+    }
+    s_dns_task = NULL;
+    vTaskDelete(NULL);
 }
 
-/* ================================================================ */
-/*  Reboot task (delayed, so HTTP response flushes first)            */
-/* ================================================================ */
-static void reboot_task(void *arg)
+static void dns_start(void)
 {
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    esp_restart();
+    if (s_dns_running) return;
+    s_dns_running = true;
+    xTaskCreatePinnedToCore(dns_task, "dns", 3 * 1024, NULL, 5, &s_dns_task, 0);
+}
+
+static void dns_stop(void)
+{
+    if (!s_dns_running && s_dns_fd < 0) return;
+    s_dns_running = false;
+    if (s_dns_fd >= 0) {
+        shutdown(s_dns_fd, SHUT_RDWR);
+        close(s_dns_fd);
+        s_dns_fd = -1;
+    }
+    for (int i = 0; i < 20 && s_dns_task != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
 }
 
 /* ================================================================ */
@@ -505,8 +555,11 @@ static esp_err_t h_submit(httpd_req_t *req) {
         snprintf(resp, sizeof(resp), "{\"success\":true}");
         send_json(req, resp);
 
-        /* reboot after a short delay */
-        xTaskCreatePinnedToCore(reboot_task, "reboot", 2048, NULL, 1, NULL, 0);
+        /* Keep AP + HTTP alive for /done.html and POST /exit.
+         * Drop the test STA session so MQTT does not start until
+         * config mode actually exits (xiaozhi-style, no reboot). */
+        esp_wifi_disconnect();
+        s_connecting = false;
     } else {
         esp_wifi_disconnect();
         s_connecting = false;
@@ -557,11 +610,26 @@ static esp_err_t h_adv_submit(httpd_req_t *req) {
     return ESP_OK;
 }
 
+/* POST /exit  — stop portal, connect STA, no reboot */
+static esp_err_t h_exit(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    send_json(req, "{\"success\":true}");
+    if (s_exiting) {
+        return ESP_OK;
+    }
+    s_exiting = true;
+    xTaskCreatePinnedToCore(exit_config_task, "wifi_exit", 4096, NULL, 5, NULL, 0);
+    return ESP_OK;
+}
+
 /* ================================================================ */
 /*  HTTP server                                                      */
 /* ================================================================ */
 static void http_start(void)
 {
+    if (s_httpd) return;
     httpd_config_t c = HTTPD_DEFAULT_CONFIG();
     c.max_uri_handlers   = 16;
     c.max_open_sockets   = 13;
@@ -578,6 +646,7 @@ static void http_start(void)
     const httpd_uri_t uri_saved_def  = {"/saved/set_default",HTTP_GET,  h_saved_set_default,  NULL};
     const httpd_uri_t uri_adv_get    = {"/advanced/config",  HTTP_GET,  h_adv_get,            NULL};
     const httpd_uri_t uri_adv_submit = {"/advanced/submit",  HTTP_POST, h_adv_submit,         NULL};
+    const httpd_uri_t uri_exit       = {"/exit",             HTTP_POST, h_exit,               NULL};
 
     httpd_register_uri_handler(s_httpd, &uri_root);
     httpd_register_uri_handler(s_httpd, &uri_done);
@@ -588,9 +657,18 @@ static void http_start(void)
     httpd_register_uri_handler(s_httpd, &uri_saved_def);
     httpd_register_uri_handler(s_httpd, &uri_adv_get);
     httpd_register_uri_handler(s_httpd, &uri_adv_submit);
+    httpd_register_uri_handler(s_httpd, &uri_exit);
 
     httpd_register_err_handler(s_httpd, HTTPD_404_NOT_FOUND, h_404);
     ESP_LOGI(TAG, "HTTP server ready at http://%s", AP_IP);
+}
+
+static void http_stop(void)
+{
+    if (!s_httpd) return;
+    httpd_stop(s_httpd);
+    s_httpd = NULL;
+    ESP_LOGI(TAG, "HTTP server stopped");
 }
 
 /* ================================================================ */
@@ -624,8 +702,8 @@ static void ev_handler(void *arg, esp_event_base_t base,
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&ev->ip_info.ip));
         if (s_ip_sem) xSemaphoreGive(s_ip_sem);
-        /* 只在首次获取 IP 时创建 MQTT 任务，避免 WiFi 重连导致重复创建 */
-        if (!s_mqtt_started) {
+        /* 配网试连阶段不启动 MQTT；退出配网拿到正式 IP 后再建任务 */
+        if (!s_mqtt_started && !s_provisioning) {
             s_mqtt_started = true;
             xTaskCreatePinnedToCore(mqtt_task, "mqtt_task", 6144, NULL, 5, NULL, 1);
         }
@@ -685,10 +763,56 @@ static bool sta_try(const char *ssid, const char *pass, const uint8_t *bssid)
 /* ================================================================ */
 static void start_provisioning(void)
 {
-    ESP_LOGI(TAG, "Starting HTTP + DNS for provisioning...");
+    if (s_provisioning && s_httpd) {
+        ESP_LOGW(TAG, "Provisioning already active");
+        return;
+    }
+    s_provisioning = true;
+    ESP_LOGI(TAG, "Starting HTTP + DNS for provisioning (no reboot)");
     http_start();
-    xTaskCreatePinnedToCore(dns_task, "dns", 3*1024, NULL, 5, NULL, 0);
-    while (1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
+    dns_start();
+}
+
+static void exit_config_task(void *arg)
+{
+    (void)arg;
+    /* Wait for HTTP /exit response to flush */
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    ESP_LOGI(TAG, "Exiting config mode...");
+    http_stop();
+    dns_stop();
+    s_connecting = false;
+
+    char ssid[64], pass[64];
+    uint8_t bssid[6] = {0};
+    if (!nvs_saved_get(0, ssid, sizeof(ssid), pass, sizeof(pass), bssid)) {
+        ESP_LOGW(TAG, "No saved credentials after exit, keeping portal");
+        s_exiting = false;
+        start_provisioning();
+        vTaskDelete(NULL);
+        return;
+    }
+
+    s_provisioning = false;
+    bool use_bssid = nvs_adv_get_u8(NVS_KEY_REM_BSSID, 0) && !memiszero(bssid, 6);
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    xSemaphoreTake(s_ip_sem, 0);
+    if (sta_try(ssid, pass, use_bssid ? bssid : NULL)) {
+        ESP_LOGI(TAG, "Wi-Fi ready (STA) after provisioning");
+    } else {
+        ESP_LOGW(TAG, "STA connect failed after exit, restarting provisioning");
+        wifi_config_t ap_cfg;
+        char ap_ssid[32];
+        build_ap_config(&ap_cfg, ap_ssid, sizeof(ap_ssid));
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+        ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_AP, &ap_cfg));
+        ESP_LOGI(TAG, "APSTA restored: AP=\"%s\"", ap_ssid);
+        s_exiting = false;
+        start_provisioning();
+    }
+    vTaskDelete(NULL);
 }
 
 /* ================================================================ */
@@ -738,6 +862,6 @@ void wifi_init(void)
         }
     }
 
-    ESP_LOGW(TAG, "No saved credentials — staying in provisioning");
+    ESP_LOGW(TAG, "No saved credentials — entering provisioning (non-blocking)");
     start_provisioning();
 }
