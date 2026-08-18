@@ -85,3 +85,5 @@ I (5276) tts_parser: unicode:0x597d -> hao3
 ```
 
 如果大家有更好的串口工具，欢迎留言。
+
+test git
