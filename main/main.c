@@ -45,7 +45,7 @@ int app_main()
 
     if (tts_init() != ESP_OK) return 0;
 
-    recorder_init();  /* VAD 触发录音 + MQTT 上传 */
+    //recorder_init();  /* VAD 触发录音 + MQTT 上传 */
 
     wifi_init();
     vTaskDelay(1000);
