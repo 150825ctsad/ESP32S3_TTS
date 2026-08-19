@@ -28,7 +28,7 @@
 /*  - 数字增益 +4dB，软限幅防止削波破音                                */
 /* ------------------------------------------------------------------ */
 #define AUDIO_PREPROCESS_EN   1
-#define AUDIO_PRE_GAIN        1.0f     /* 不额外放大，避免功放过载击穿 */
+#define AUDIO_PRE_GAIN        1.6f     /* ≈ +4.1dB */
 
 typedef struct {
     float b0, b1, b2, a1, a2;   /* 归一化系数 (RBJ cookbook) */

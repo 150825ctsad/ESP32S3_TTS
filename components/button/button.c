@@ -16,7 +16,7 @@
 
 #define VOL_STEP            5
 #define VOL_MIN             0
-#define VOL_MAX             100
+#define VOL_MAX             100   
 
 #define SCAN_INTERVAL_MS    20          /* 扫描周期 */
 #define DEBOUNCE_COUNT      3           /* 消抖确认次数 (60ms) */
@@ -97,7 +97,7 @@ void button_init(void)
     gpio_config_t conf = {
         .mode         = GPIO_MODE_INPUT,
         .intr_type    = GPIO_INTR_DISABLE,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .pin_bit_mask = (1ULL << GPIO_BTN_VOL_UP) | (1ULL << GPIO_BTN_VOL_DOWN),
     };

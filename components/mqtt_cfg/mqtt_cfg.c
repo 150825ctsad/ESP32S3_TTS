@@ -29,7 +29,7 @@
 #include "cJSON.h"
 
 #define TAG                    "MQTT_CLIENT"
-#define MQTT_BROKER_URI        "mqtt://192.168.1.200"
+#define MQTT_BROKER_URI        "mqtt://mqtt-xiaoyi.gejia.tech" //mqtt:mqtt-xiaoyi.gejia.tech wss:https://iot-xiaoyi.gejia.tech
 #define MQTT_BROKER_PORT       1883
 
 #define MQTT_USERNAME          "esp32s3"
@@ -157,7 +157,7 @@ static void handle_command(const char *msg_str)
         ESP_LOGI(TAG, "TTS queued: %s", tts->valuestring);
     }
 
-    /* 2. 音量控制：{"vol":50} 或 {"vol":"50"} (0-100) */
+    /* 2. 音量控制：{"vol":50} 或 {"vol":"50"} (0-70，上限防过热) */
     cJSON *vol = cJSON_GetObjectItemCaseSensitive(root, "vol");
     int v = -1;
     if (cJSON_IsNumber(vol)) {
@@ -313,7 +313,7 @@ void mqtt_task(void *pvParameters)
     tts_set_complete_callback(on_tts_complete);
 
     /* 等待网络连接 */
-    vTaskDelay(pdMS_TO_TICKS(5000));
+    vTaskDelay(pdMS_TO_TICKS(20000));
 
     mqtt_start();
 
@@ -321,7 +321,7 @@ void mqtt_task(void *pvParameters)
         if (mqtt_connected) {
             publish_wifi_info();
         }
-        vTaskDelay(pdMS_TO_TICKS(10000));
+        vTaskDelay(pdMS_TO_TICKS(20000));
     }
 }
 
