@@ -1,25 +1,17 @@
 /* voice_session.c  -- 语音会话状态机
  *
- * 唤醒词（你好小易）→ 云端 WS：上行 PCM → 下行 TTS PCM → 回 IDLE。
+ * 参考 xiaozhi-esp32：ESP-SR AFE 双管线
+ *   待机：AFE_TYPE_SR + WakeNet（你好小易）
+ *   上行：AFE_TYPE_VC + WebRTC NS + VAD（单麦，无参考通道，不开设备 AEC）
  *
  * 状态机：
- *   IDLE ──wakenet命中──▶ CONNECTING ──连接成功──▶ STREAMING ──VAD静音/10s──▶ WAIT_TTS
- *     ▲                       │(3s超时/失败: 提示音) │                          │(5s超时)
- *     │                       │                      ▼                          │
- *     └── done/error/断线 ◀── PLAYING ◀──────── 收到首字节 PCM ◀───────────────┘
- *
- * 任务划分：
- *   session_task: mic 读取 → WakeNet + 上行组帧 + VAD + 状态机
- *   player_task : rb_read → esp_audio_play（rb_reset 仅本任务执行）
- *
- * 下行缓冲（ring）排空握手：
- *   正常结束（done）  → rb_done_write   → player 播完剩余后 rb_read 返回 RB_DONE → reset
- *   强制结束（异常）  → rb_unblock_reader → player rb_read 返回 RB_TIMEOUT → reset
+ *   IDLE ──AFE 唤醒──▶ CONNECTING ──连接成功──▶ STREAMING ──VAD静音/10s──▶ WAIT_TTS
+ *     ▲                     │(3s超时: 提示音)                              │(5s超时)
+ *     └── done/error ◀── PLAYING ◀── TTS PCM
  ******************************************************************************/
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <math.h>
 #include "ws_cfg.h"
 #include "ws_cfg_internal.h"
 #include "esp_log.h"
@@ -28,32 +20,37 @@
 #include "esp_board_init.h"
 #include "esp_wn_iface.h"
 #include "esp_wn_models.h"
+#include "esp_afe_sr_models.h"
+#include "esp_nsn_models.h"
+#include "esp_vadn_models.h"
 #include "model_path.h"
 #include "sdkconfig.h"
 #include "esp_heap_caps.h"
+#include "cJSON.h"
 #include "ringbuf.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 
 #define TAG "VOICE_SESSION"
 
-#define SR_CHUNK_MAX         2048             /* WakeNet 单帧上限 */
+#define SESS_EVT_WAKE     (1 << 8)
+#define SESS_EVT_VAD_END  (1 << 9)
 
-/* 音频参数 */
 #define MIC_CH_MAX           4
-#define MIC_FRAME_SAMPLES    240              /* 一次读取的采样数 */
-#define PCM_FRAME_SAMPLES    512              /* 上行 PCM 帧：512 采样 = 1024B = 32ms */
+#define MIC_FRAME_SAMPLES    240
+#define PCM_FRAME_SAMPLES    512
+#define SR_CHUNK_MAX         2048
+#define AFE_FEED_MAX         2048
 
-/* 环形缓冲：下行 TTS 音频（WS 回调写 → player 读） */
 #define RING_BLOCK_SIZE      1024
-#define RING_N_BLOCKS        32               /* 32KB ≈ 1s @16kHz mono */
+#define RING_N_BLOCKS        32
+#define UP_RING_BLOCKS       16
 
-/* VAD（沿用 recorder 参数，帧长 ~15ms） */
-#define VAD_RMS_THRESHOLD    300              /* RMS 阈值 */
-#define VAD_HANGOVER         32               /* 静音挂尾帧数 ≈ 480ms */
+#define VAD_RMS_THRESHOLD    300
+#define VAD_HANGOVER         32
 
-/* 会话超时 */
 #define CONNECT_TIMEOUT_MS   3000
 #define STREAM_MAX_MS        10000
 #define WAIT_TTS_TIMEOUT_MS  5000
@@ -67,16 +64,211 @@ typedef enum {
     SESS_PLAYING,
 } sess_state_t;
 
+typedef enum {
+    AFE_PIPE_WAKE = 0,
+    AFE_PIPE_VC,
+} afe_pipe_t;
+
 static EventGroupHandle_t s_evt = NULL;
 static ringbuf_handle_t s_ring = NULL;
+static ringbuf_handle_t s_up_ring = NULL;
+static SemaphoreHandle_t s_afe_mux = NULL;
 
 static const esp_wn_iface_t *s_wn = NULL;
 static model_iface_data_t *s_wn_data = NULL;
 static int s_wn_chunk = 0;
 static char s_wn_name[64] = {0};
 
+static const esp_afe_sr_iface_t *s_afe_wake = NULL;
+static esp_afe_sr_data_t *s_afe_wake_data = NULL;
+static int s_afe_wake_feed = 0;
+
+static const esp_afe_sr_iface_t *s_afe_vc = NULL;
+static esp_afe_sr_data_t *s_afe_vc_data = NULL;
+static int s_afe_vc_feed = 0;
+
+static volatile afe_pipe_t s_pipe = AFE_PIPE_WAKE;
 static volatile sess_state_t s_state = SESS_IDLE;
 static char s_device[13] = "000000000000";
+static volatile bool s_had_speech = false;
+
+static char s_push_msgid[80];
+static char s_push_tts[768];
+static volatile bool s_push_active = false;
+static ws_cfg_push_done_cb_t s_push_done_cb = NULL;
+
+/* ================================================================ */
+/*  AFE                                                             */
+/* ================================================================ */
+
+static void afe_set_pipe(afe_pipe_t pipe)
+{
+    if (s_afe_mux) xSemaphoreTake(s_afe_mux, portMAX_DELAY);
+    s_pipe = pipe;
+    if (pipe == AFE_PIPE_WAKE && s_afe_wake && s_afe_wake_data) {
+        s_afe_wake->reset_buffer(s_afe_wake_data);
+    }
+    if (pipe == AFE_PIPE_VC && s_afe_vc && s_afe_vc_data) {
+        s_afe_vc->reset_buffer(s_afe_vc_data);
+        if (s_afe_vc->reset_vad) s_afe_vc->reset_vad(s_afe_vc_data);
+    }
+    if (s_afe_mux) xSemaphoreGive(s_afe_mux);
+    s_had_speech = false;
+}
+
+static void afe_feed_mono(const int16_t *mono, int nsamp)
+{
+    static int16_t acc[AFE_FEED_MAX];
+    static int acc_n = 0;
+    static afe_pipe_t acc_pipe = AFE_PIPE_WAKE;
+
+    const esp_afe_sr_iface_t *iface = NULL;
+    esp_afe_sr_data_t *data = NULL;
+    int chunk = 0;
+    afe_pipe_t pipe = s_pipe;
+
+    if (pipe != acc_pipe) {
+        acc_n = 0;
+        acc_pipe = pipe;
+    }
+
+    if (pipe == AFE_PIPE_WAKE && s_afe_wake && s_afe_wake_data) {
+        iface = s_afe_wake;
+        data = s_afe_wake_data;
+        chunk = s_afe_wake_feed;
+    } else if (pipe == AFE_PIPE_VC && s_afe_vc && s_afe_vc_data) {
+        iface = s_afe_vc;
+        data = s_afe_vc_data;
+        chunk = s_afe_vc_feed;
+    } else {
+        acc_n = 0;
+        return;
+    }
+    if (chunk <= 0 || chunk > AFE_FEED_MAX) return;
+
+    for (int i = 0; i < nsamp; i++) {
+        if (acc_n < AFE_FEED_MAX) acc[acc_n++] = mono[i];
+        if (acc_n >= chunk) {
+            if (s_afe_mux) xSemaphoreTake(s_afe_mux, portMAX_DELAY);
+            if (s_pipe == pipe) iface->feed(data, acc);
+            if (s_afe_mux) xSemaphoreGive(s_afe_mux);
+            acc_n = 0;
+        }
+    }
+}
+
+static bool afe_init_wake(srmodel_list_t *models)
+{
+    afe_config_t *cfg = afe_config_init("M", models, AFE_TYPE_SR, AFE_MODE_HIGH_PERF);
+    if (cfg == NULL) return false;
+    cfg->aec_init = false;
+    cfg->se_init = false;
+    cfg->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
+    cfg->afe_perferred_core = 1;
+    cfg->afe_perferred_priority = 1;
+    cfg->wakenet_init = true;
+    if (s_wn_name[0]) cfg->wakenet_model_name = s_wn_name;
+    cfg->wakenet_mode = DET_MODE_90;
+
+    s_afe_wake = esp_afe_handle_from_config(cfg);
+    if (s_afe_wake == NULL) {
+        afe_config_free(cfg);
+        return false;
+    }
+    s_afe_wake_data = s_afe_wake->create_from_config(cfg);
+    afe_config_print(cfg);
+    afe_config_free(cfg);
+    if (s_afe_wake_data == NULL) {
+        s_afe_wake = NULL;
+        return false;
+    }
+    s_afe_wake_feed = s_afe_wake->get_feed_chunksize(s_afe_wake_data);
+    s_afe_wake->print_pipeline(s_afe_wake_data);
+    ESP_LOGI(TAG, "AFE wake ready, feed=%d", s_afe_wake_feed);
+    return true;
+}
+
+static bool afe_init_vc(srmodel_list_t *models)
+{
+    afe_config_t *cfg = afe_config_init("M", models, AFE_TYPE_VC, AFE_MODE_HIGH_PERF);
+    if (cfg == NULL) return false;
+    cfg->aec_init = false;
+    cfg->se_init = false;
+    cfg->wakenet_init = false;
+    cfg->agc_init = false;
+    cfg->vad_init = true;
+    cfg->vad_mode = VAD_MODE_0;
+    cfg->vad_min_noise_ms = 400;
+    cfg->vad_min_speech_ms = 128;
+    cfg->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
+    cfg->afe_perferred_core = 1;
+    cfg->afe_perferred_priority = 1;
+
+    /* AFE 2.4 把 "WEBRTC" 当 flash 模型名去加载会失败；有 nsnet 才开 NS */
+    char *ns_name = models ? esp_srmodel_filter(models, ESP_NSNET_PREFIX, NULL) : NULL;
+    if (ns_name) {
+        cfg->ns_init = true;
+        cfg->ns_model_name = ns_name;
+        cfg->afe_ns_mode = AFE_NS_MODE_NET;
+    } else {
+        cfg->ns_init = false;
+        cfg->ns_model_name = NULL;
+    }
+    char *vad_name = models ? esp_srmodel_filter(models, ESP_VADN_PREFIX, NULL) : NULL;
+    if (vad_name) cfg->vad_model_name = vad_name;
+
+    s_afe_vc = esp_afe_handle_from_config(cfg);
+    if (s_afe_vc == NULL) {
+        afe_config_free(cfg);
+        return false;
+    }
+    s_afe_vc_data = s_afe_vc->create_from_config(cfg);
+    afe_config_print(cfg);
+    afe_config_free(cfg);
+    if (s_afe_vc_data == NULL) {
+        s_afe_vc = NULL;
+        return false;
+    }
+    s_afe_vc_feed = s_afe_vc->get_feed_chunksize(s_afe_vc_data);
+    s_afe_vc->print_pipeline(s_afe_vc_data);
+    ESP_LOGI(TAG, "AFE vc ready, feed=%d (NS+VAD)", s_afe_vc_feed);
+    return true;
+}
+
+static void afe_fetch_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        afe_pipe_t pipe = s_pipe;
+        afe_fetch_result_t *res = NULL;
+
+        if (pipe == AFE_PIPE_WAKE && s_afe_wake && s_afe_wake_data) {
+            res = s_afe_wake->fetch_with_delay(s_afe_wake_data, pdMS_TO_TICKS(50));
+            if (res && res->ret_value != ESP_FAIL &&
+                res->wakeup_state == WAKENET_DETECTED &&
+                s_state == SESS_IDLE) {
+                ESP_LOGI(TAG, "!!! Wake word detected (AFE) !!!");
+                if (s_evt) xEventGroupSetBits(s_evt, SESS_EVT_WAKE);
+            }
+        } else if (pipe == AFE_PIPE_VC && s_afe_vc && s_afe_vc_data) {
+            res = s_afe_vc->fetch_with_delay(s_afe_vc_data, pdMS_TO_TICKS(50));
+            if (res && res->ret_value != ESP_FAIL && res->data && res->data_size > 0) {
+                if (s_state == SESS_STREAMING && s_up_ring) {
+                    rb_write(s_up_ring, (char *)res->data, res->data_size, 0);
+                }
+                if (s_state == SESS_STREAMING) {
+                    if (res->vad_state == VAD_SPEECH) {
+                        s_had_speech = true;
+                    } else if (res->vad_state == VAD_SILENCE && s_had_speech) {
+                        if (s_evt) xEventGroupSetBits(s_evt, SESS_EVT_VAD_END);
+                    }
+                }
+            }
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+    }
+}
 
 /* ================================================================ */
 /*  会话收尾                                                         */
@@ -84,32 +276,92 @@ static char s_device[13] = "000000000000";
 
 static void session_teardown(bool normal)
 {
+    char msgid[sizeof(s_push_msgid)];
+    bool was_push = s_push_active;
+    msgid[0] = '\0';
+    if (was_push) {
+        snprintf(msgid, sizeof(msgid), "%s", s_push_msgid);
+        s_push_active = false;
+        s_push_msgid[0] = '\0';
+        s_push_tts[0] = '\0';
+    }
+
     if (normal) {
-        /* done：rb_done_write → player 播完 ring 剩余后返回 RB_DONE → 自行 reset */
         rb_done_write(s_ring);
         ESP_LOGI(TAG, "Draining playback");
     } else {
-        /* 异常：unblock → player 立即返回 RB_TIMEOUT → 自行 reset（丢弃残留） */
         rb_unblock_reader(s_ring);
         ESP_LOGW(TAG, "Abort playback");
     }
     ws_cfg_disconnect();
+    afe_set_pipe(AFE_PIPE_WAKE);
+    if (s_evt) {
+        xEventGroupClearBits(s_evt, SESS_EVT_WAKE | SESS_EVT_VAD_END);
+    }
     s_state = SESS_IDLE;
     ESP_LOGI(TAG, "Session teardown -> IDLE");
+
+    if (was_push && msgid[0] && s_push_done_cb) {
+        s_push_done_cb(msgid, normal);
+    }
+}
+
+static void start_cloud_session(TickType_t *t_connect_start, bool push)
+{
+    s_push_active = push;
+    xEventGroupClearBits(s_evt,
+        WS_EVT_CONNECTED | WS_EVT_DISCONNECTED |
+        WS_EVT_TTS_DONE | WS_EVT_TTS_ERROR |
+        SESS_EVT_WAKE | SESS_EVT_VAD_END | SESS_EVT_PUSH);
+    if (!push && s_afe_vc && s_afe_vc_data) afe_set_pipe(AFE_PIPE_VC);
+    if (ws_cfg_connect() == ESP_OK) {
+        s_state = SESS_CONNECTING;
+        *t_connect_start = xTaskGetTickCount();
+    } else {
+        afe_set_pipe(AFE_PIPE_WAKE);
+        if (push) {
+            session_teardown(false);
+        } else {
+            ws_cfg_play_tone();
+            s_push_active = false;
+        }
+    }
+}
+
+void ws_cfg_set_push_done_cb(ws_cfg_push_done_cb_t cb)
+{
+    s_push_done_cb = cb;
+}
+
+esp_err_t ws_cfg_request_push(const char *msg_id, const char *tts_text)
+{
+    if (s_evt == NULL) {
+        ESP_LOGE(TAG, "Voice session not ready");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!ws_cfg_has_uri()) {
+        ESP_LOGE(TAG, "No ws uri for push");
+        return ESP_ERR_INVALID_STATE;
+    }
+    snprintf(s_push_msgid, sizeof(s_push_msgid), "%s", msg_id ? msg_id : "");
+    snprintf(s_push_tts, sizeof(s_push_tts), "%s", tts_text ? tts_text : "");
+    xEventGroupSetBits(s_evt, SESS_EVT_PUSH);
+    ESP_LOGI(TAG, "Push TTS queued (msgId=%s)", s_push_msgid[0] ? s_push_msgid : "-");
+    return ESP_OK;
 }
 
 /* ================================================================ */
-/*  player_task：下行 PCM 流式播放                                   */
+/*  player_task                                                      */
 /* ================================================================ */
 
 static void player_task(void *arg)
 {
+    (void)arg;
     char buf[RING_BLOCK_SIZE];
     for (;;) {
         int n = rb_read(s_ring, buf, sizeof(buf), portMAX_DELAY);
         if (n <= 0) {
-            /* RB_DONE（正常结束）或 RB_TIMEOUT/RB_ABORT（强制结束） */
-            rb_reset(s_ring);                 /* 本任务独占 reset，准备下一会话 */
+            rb_reset(s_ring);
             continue;
         }
         esp_audio_play((int16_t *)buf, n, portMAX_DELAY);
@@ -117,19 +369,35 @@ static void player_task(void *arg)
 }
 
 /* ================================================================ */
-/*  session_task：唤醒监听 + 会话状态机                              */
+/*  session_task                                                     */
 /* ================================================================ */
+
+static void stream_send_end(int16_t *tx_frame, int *tx_n, TickType_t t_stream_start)
+{
+    if (*tx_n > 0) {
+        ws_cfg_send_pcm((uint8_t *)tx_frame, *tx_n * 2);
+        *tx_n = 0;
+    }
+    int ms = (int)((xTaskGetTickCount() - t_stream_start) * portTICK_PERIOD_MS);
+    char end_json[64];
+    snprintf(end_json, sizeof(end_json), "{\"type\":\"end\",\"duration_ms\":%d}", ms);
+    ws_cfg_send_text(end_json);
+    ESP_LOGI(TAG, "Stream end (%d ms), waiting tts", ms);
+}
 
 static void session_task(void *arg)
 {
+    (void)arg;
     static int16_t frame[MIC_FRAME_SAMPLES * MIC_CH_MAX];
     static int16_t mono[512];
     static int16_t wn_buf[SR_CHUNK_MAX];
     int wn_n = 0;
-    int16_t tx_frame[PCM_FRAME_SAMPLES]; /* 上行组帧 */
+    int16_t tx_frame[PCM_FRAME_SAMPLES];
     int tx_n = 0;
     int hangover = 0;
     TickType_t t_connect_start = 0, t_stream_start = 0, t_wait_start = 0, t_play_start = 0;
+    const bool use_afe_wake = (s_afe_wake && s_afe_wake_data);
+    const bool use_afe_vc = (s_afe_vc && s_afe_vc_data);
 
     for (;;) {
         int ch = esp_get_feed_channel();
@@ -137,59 +405,132 @@ static void session_task(void *arg)
         if (ch > MIC_CH_MAX) ch = MIC_CH_MAX;
         int nbytes = MIC_FRAME_SAMPLES * ch * (int)sizeof(int16_t);
         if (esp_get_feed_data(false, frame, nbytes) != ESP_OK) {
+            static TickType_t t_fail;
+            TickType_t now = xTaskGetTickCount();
+            if (t_fail == 0 || (now - t_fail) >= pdMS_TO_TICKS(1000)) {
+                ESP_LOGW(TAG, "mic read fail");
+                t_fail = now;
+            }
             vTaskDelay(pdMS_TO_TICKS(5));
             continue;
         }
 
         int nsamp = MIC_FRAME_SAMPLES;
-        if (nsamp > (int)(sizeof(mono) / sizeof(mono[0]))) nsamp = sizeof(mono) / sizeof(mono[0]);
+        if (nsamp > (int)(sizeof(mono) / sizeof(mono[0]))) nsamp = (int)(sizeof(mono) / sizeof(mono[0]));
         for (int i = 0; i < nsamp; i++) mono[i] = frame[ch * i];
+
+        /* 每秒打一次麦能量：安静几十~几百，对着麦说话应明显升高 */
+        {
+            static uint32_t abs_acc, peak, frames;
+            static TickType_t t_log;
+            uint32_t frame_peak = 0;
+            uint32_t abs_sum = 0;
+            for (int i = 0; i < nsamp; i++) {
+                int v = mono[i];
+                uint32_t a = (uint32_t)(v < 0 ? -v : v);
+                abs_sum += a;
+                if (a > frame_peak) frame_peak = a;
+            }
+            abs_acc += abs_sum / (uint32_t)nsamp;
+            if (frame_peak > peak) peak = frame_peak;
+            frames++;
+            TickType_t now = xTaskGetTickCount();
+            if (t_log == 0 || (now - t_log) >= pdMS_TO_TICKS(1000)) {
+                ESP_LOGI(TAG, "mic |avg|=%u peak=%u frames=%u",
+                         (unsigned)(frames ? abs_acc / frames : 0),
+                         (unsigned)peak, (unsigned)frames);
+                abs_acc = 0;
+                peak = 0;
+                frames = 0;
+                t_log = now;
+            }
+        }
+
+        if (use_afe_wake || use_afe_vc) {
+            afe_feed_mono(mono, nsamp);
+        }
 
         switch (s_state) {
 
-        /* ---------- 空闲：喂 WakeNet ---------- */
         case SESS_IDLE:
-            if (s_wn && s_wn_data) {
+            if (xEventGroupGetBits(s_evt) & SESS_EVT_PUSH) {
+                xEventGroupClearBits(s_evt, SESS_EVT_PUSH);
+                if (!ws_cfg_has_uri()) {
+                    ESP_LOGW(TAG, "Push without uri");
+                    if (s_push_msgid[0] && s_push_done_cb) {
+                        s_push_done_cb(s_push_msgid, false);
+                    }
+                    s_push_msgid[0] = '\0';
+                    s_push_tts[0] = '\0';
+                    break;
+                }
+                ESP_LOGI(TAG, "Cloud push: connect WS (msgId=%s)",
+                         s_push_msgid[0] ? s_push_msgid : "-");
+                start_cloud_session(&t_connect_start, true);
+                break;
+            }
+            if (use_afe_wake) {
+                if (xEventGroupGetBits(s_evt) & SESS_EVT_WAKE) {
+                    xEventGroupClearBits(s_evt, SESS_EVT_WAKE);
+                    if (!ws_cfg_has_uri()) {
+                        ESP_LOGW(TAG, "No ws uri yet, tone and ignore");
+                        ws_cfg_play_tone();
+                        break;
+                    }
+                    start_cloud_session(&t_connect_start, false);
+                }
+            } else if (s_wn && s_wn_data) {
                 for (int i = 0; i < nsamp && wn_n < (int)(sizeof(wn_buf) / sizeof(wn_buf[0])); i++) {
                     wn_buf[wn_n++] = mono[i];
                 }
                 if (s_wn_chunk > 0 && wn_n >= s_wn_chunk) {
                     int leftover = wn_n - s_wn_chunk;
-                    if (s_wn->detect(s_wn_data, wn_buf) == WAKENET_DETECTED) {
-                        if (leftover > 0) {
-                            memmove(wn_buf, wn_buf + s_wn_chunk, leftover * sizeof(int16_t));
-                        }
-                        wn_n = leftover;
-                        ESP_LOGI(TAG, "!!! Wake word detected !!!");
+                    wakenet_state_t st = s_wn->detect(s_wn_data, wn_buf);
+                    if (leftover > 0) {
+                        memmove(wn_buf, wn_buf + s_wn_chunk, leftover * sizeof(int16_t));
+                    }
+                    wn_n = leftover;
+                    if (st == WAKENET_DETECTED) {
+                        ESP_LOGI(TAG, "!!! Wake word detected (raw WN) !!!");
                         wn_n = 0;
                         if (!ws_cfg_has_uri()) {
                             ESP_LOGW(TAG, "No ws uri yet, tone and ignore");
                             ws_cfg_play_tone();
                             break;
                         }
-                        xEventGroupClearBits(s_evt,
-                            WS_EVT_CONNECTED | WS_EVT_DISCONNECTED |
-                            WS_EVT_TTS_DONE | WS_EVT_TTS_ERROR);
-                        if (ws_cfg_connect() == ESP_OK) {
-                            s_state = SESS_CONNECTING;
-                            t_connect_start = xTaskGetTickCount();
-                        } else {
-                            ws_cfg_play_tone();
-                        }
-                    } else {
-                        if (leftover > 0) {
-                            memmove(wn_buf, wn_buf + s_wn_chunk, leftover * sizeof(int16_t));
-                        }
-                        wn_n = leftover;
+                        start_cloud_session(&t_connect_start, false);
                     }
                 }
             }
             break;
 
-        /* ---------- 连接中：等 CONNECTED / 超时 ---------- */
         case SESS_CONNECTING:
             if (xEventGroupGetBits(s_evt) & WS_EVT_CONNECTED) {
                 xEventGroupClearBits(s_evt, WS_EVT_CONNECTED);
+                if (s_push_active) {
+                    cJSON *start = cJSON_CreateObject();
+                    if (start) {
+                        cJSON_AddStringToObject(start, "type", "start");
+                        cJSON_AddStringToObject(start, "device", s_device);
+                        if (s_push_msgid[0]) {
+                            cJSON_AddStringToObject(start, "msgId", s_push_msgid);
+                        }
+                        if (s_push_tts[0]) {
+                            cJSON_AddStringToObject(start, "tts", s_push_tts);
+                        }
+                        cJSON_AddTrueToObject(start, "cloud");
+                        char *js = cJSON_PrintUnformatted(start);
+                        if (js) {
+                            ws_cfg_send_text(js);
+                            cJSON_free(js);
+                        }
+                        cJSON_Delete(start);
+                    }
+                    ESP_LOGI(TAG, "WS connected, wait cloud TTS");
+                    t_wait_start = xTaskGetTickCount();
+                    s_state = SESS_WAIT_TTS;
+                    break;
+                }
                 ESP_LOGI(TAG, "WS connected, start streaming");
                 char start_json[160];
                 snprintf(start_json, sizeof(start_json),
@@ -198,34 +539,46 @@ static void session_task(void *arg)
                 ws_cfg_send_text(start_json);
                 tx_n = 0;
                 hangover = 0;
+                s_had_speech = false;
                 t_stream_start = xTaskGetTickCount();
                 s_state = SESS_STREAMING;
             } else if ((xEventGroupGetBits(s_evt) & WS_EVT_DISCONNECTED) ||
                        (xTaskGetTickCount() - t_connect_start > pdMS_TO_TICKS(CONNECT_TIMEOUT_MS))) {
                 ESP_LOGW(TAG, "WS connect failed/timeout");
+                bool push = s_push_active;
                 session_teardown(false);
-                ws_cfg_play_tone();
+                if (!push) ws_cfg_play_tone();
             }
             break;
 
-        /* ---------- 上行：组帧 + VAD ---------- */
         case SESS_STREAMING: {
-            for (int i = 0; i < nsamp; i++) {
-                tx_frame[tx_n++] = mono[i];
-                if (tx_n == PCM_FRAME_SAMPLES) {
-                    ws_cfg_send_pcm((uint8_t *)tx_frame, sizeof(tx_frame));
-                    tx_n = 0;
+            if (use_afe_vc && s_up_ring) {
+                char up[PCM_FRAME_SAMPLES * 2];
+                int n = rb_read(s_up_ring, up, sizeof(up), 0);
+                if (n > 0) {
+                    ws_cfg_send_pcm((uint8_t *)up, n);
+                }
+            } else {
+                for (int i = 0; i < nsamp; i++) {
+                    tx_frame[tx_n++] = mono[i];
+                    if (tx_n == PCM_FRAME_SAMPLES) {
+                        ws_cfg_send_pcm((uint8_t *)tx_frame, sizeof(tx_frame));
+                        tx_n = 0;
+                    }
+                }
+                long long sum = 0;
+                for (int i = 0; i < nsamp; i++) sum += (long long)mono[i] * mono[i];
+                if (sum / nsamp < (long long)VAD_RMS_THRESHOLD * VAD_RMS_THRESHOLD) {
+                    if (++hangover >= VAD_HANGOVER) goto stream_end;
+                } else {
+                    hangover = 0;
                 }
             }
 
-            long long sum = 0;
-            for (int i = 0; i < nsamp; i++) sum += (long long)mono[i] * mono[i];
-            if (sum / nsamp < (long long)VAD_RMS_THRESHOLD * VAD_RMS_THRESHOLD) {
-                if (++hangover >= VAD_HANGOVER) goto stream_end;
-            } else {
-                hangover = 0;
+            if (use_afe_vc && (xEventGroupGetBits(s_evt) & SESS_EVT_VAD_END)) {
+                xEventGroupClearBits(s_evt, SESS_EVT_VAD_END);
+                goto stream_end;
             }
-
             if (xTaskGetTickCount() - t_stream_start > pdMS_TO_TICKS(STREAM_MAX_MS)) {
                 goto stream_end;
             }
@@ -236,23 +589,13 @@ static void session_task(void *arg)
             break;
 
 stream_end:
-            /* 残余帧 + end 帧 → 等 TTS */
-            if (tx_n > 0) {
-                ws_cfg_send_pcm((uint8_t *)tx_frame, tx_n * 2);
-                tx_n = 0;
-            }
-            int ms = (int)((xTaskGetTickCount() - t_stream_start) * portTICK_PERIOD_MS);
-            char end_json[64];
-            snprintf(end_json, sizeof(end_json),
-                     "{\"type\":\"end\",\"duration_ms\":%d}", ms);
-            ws_cfg_send_text(end_json);
-            ESP_LOGI(TAG, "Stream end (%d ms), waiting tts", ms);
+            stream_send_end(tx_frame, &tx_n, t_stream_start);
+            afe_set_pipe(AFE_PIPE_WAKE);
             s_state = SESS_WAIT_TTS;
             t_wait_start = xTaskGetTickCount();
             break;
         }
 
-        /* ---------- 等 TTS：首字节音频 → 播放；done/超时 → 收尾 ---------- */
         case SESS_WAIT_TTS: {
             EventBits_t bits = xEventGroupGetBits(s_evt);
             if (rb_bytes_filled(s_ring) > 0) {
@@ -269,14 +612,14 @@ stream_end:
             } else if (bits & WS_EVT_DISCONNECTED) {
                 xEventGroupClearBits(s_evt, WS_EVT_DISCONNECTED);
                 session_teardown(false);
-            } else if (xTaskGetTickCount() - t_wait_start > pdMS_TO_TICKS(WAIT_TTS_TIMEOUT_MS)) {
+            } else if (xTaskGetTickCount() - t_wait_start >
+                       pdMS_TO_TICKS(s_push_active ? 15000 : WAIT_TTS_TIMEOUT_MS)) {
                 ESP_LOGW(TAG, "TTS timeout");
                 session_teardown(false);
             }
             break;
         }
 
-        /* ---------- 播放中：done → 排空收尾；异常/超时 → 强制收尾 ---------- */
         case SESS_PLAYING: {
             EventBits_t bits = xEventGroupGetBits(s_evt);
             if (bits & WS_EVT_TTS_DONE) {
@@ -300,7 +643,7 @@ stream_end:
 }
 
 /* ================================================================ */
-/*  提示音：播放 voice_data 分区 WAV（16kHz/16bit/mono）             */
+/*  提示音                                                           */
 /* ================================================================ */
 
 esp_err_t ws_cfg_play_tone(void)
@@ -324,7 +667,6 @@ esp_err_t ws_cfg_play_tone(void)
     uint32_t data_off = 0, data_len = 0;
     if (part->size >= 44 && memcmp(wav, "RIFF", 4) == 0 &&
         memcmp(wav + 8, "WAVE", 4) == 0) {
-        /* 遍历 chunk 找 data */
         uint32_t off = 12;
         while (off + 8 <= part->size) {
             uint32_t size = wav[off + 4] | (wav[off + 5] << 8) |
@@ -344,11 +686,13 @@ esp_err_t ws_cfg_play_tone(void)
         return ESP_FAIL;
     }
 
-    /* 分块阻塞播放（板级自动 16bit→32bit、mono→stereo） */
     uint32_t pos = 0;
+    int16_t ram[512];
     while (pos < data_len) {
-        uint32_t chunk = data_len - pos > 1024 ? 1024 : data_len - pos;
-        esp_audio_play((const int16_t *)(wav + data_off + pos), (int)chunk, portMAX_DELAY);
+        uint32_t chunk = data_len - pos > sizeof(ram) ? sizeof(ram) : data_len - pos;
+        memcpy(ram, wav + data_off + pos, chunk);
+        /* mmap 区只读：EQ/软音量会就地改写，必须先拷到 RAM */
+        esp_audio_play(ram, (int)chunk, portMAX_DELAY);
         pos += chunk;
     }
     esp_partition_munmap(map_handle);
@@ -364,13 +708,14 @@ esp_err_t ws_cfg_init(void)
 {
     if (s_evt == NULL) s_evt = xEventGroupCreate();
     if (s_ring == NULL) s_ring = rb_create(RING_BLOCK_SIZE, RING_N_BLOCKS);
-    if (s_evt == NULL || s_ring == NULL) {
-        ESP_LOGE(TAG, "Event group / ringbuf create failed");
+    if (s_up_ring == NULL) s_up_ring = rb_create(RING_BLOCK_SIZE, UP_RING_BLOCKS);
+    if (s_afe_mux == NULL) s_afe_mux = xSemaphoreCreateMutex();
+    if (s_evt == NULL || s_ring == NULL || s_up_ring == NULL || s_afe_mux == NULL) {
+        ESP_LOGE(TAG, "Event group / ringbuf / mutex create failed");
         return ESP_ERR_NO_MEM;
     }
     ws_cfg_attach(s_evt, s_ring);
 
-    /* 设备唯一 ID（与 MQTT client_id 同源） */
     uint8_t mac[6];
     if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
         snprintf(s_device, sizeof(s_device),
@@ -378,7 +723,6 @@ esp_err_t ws_cfg_init(void)
                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     }
 
-    /* 从 model 分区加载 WakeNet（你好小易） */
     srmodel_list_t *models = esp_srmodel_init("model");
     if (models == NULL || models->num == 0) {
         ESP_LOGE(TAG, "esp_srmodel_init(model) failed, check model partition flash");
@@ -388,47 +732,43 @@ esp_err_t ws_cfg_init(void)
             ESP_LOGI(TAG, "  [%d] %s", i, models->model_name[i] ? models->model_name[i] : "?");
         }
         char *wn_name = esp_srmodel_filter(models, ESP_WN_PREFIX, "nihaoxiaoyi");
-        if (wn_name == NULL) {
-            wn_name = esp_srmodel_filter(models, ESP_WN_PREFIX, NULL);
-        }
-        if (wn_name) {
-            snprintf(s_wn_name, sizeof(s_wn_name), "%s", wn_name);
-        }
+        if (wn_name == NULL) wn_name = esp_srmodel_filter(models, ESP_WN_PREFIX, NULL);
+        if (wn_name) snprintf(s_wn_name, sizeof(s_wn_name), "%s", wn_name);
     }
+
+    ESP_LOGI(TAG, "heap before AFE: intern=%u spiram=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
     if (s_wn_name[0]) {
-        s_wn = esp_wn_handle_from_name(s_wn_name);
-        if (s_wn == NULL) {
-            ESP_LOGE(TAG, "WakeNet %s not found", s_wn_name);
-        } else {
-            ESP_LOGI(TAG, "heap before WN create: intern=%u spiram=%u",
-                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-            s_wn_data = s_wn->create(s_wn_name, DET_MODE_90);
-            if (s_wn_data == NULL) {
-                ESP_LOGE(TAG, "WakeNet create failed (OOM?), fallback to play-only");
-                s_wn = NULL;
-            } else {
-                s_wn_chunk = s_wn->get_samp_chunksize(s_wn_data);
-                if (s_wn_chunk > SR_CHUNK_MAX) {
-                    ESP_LOGE(TAG, "WN chunk %d too large for buffer", s_wn_chunk);
-                    s_wn->destroy(s_wn_data);
-                    s_wn_data = NULL;
-                    s_wn = NULL;
-                } else {
-                    const char *ww = esp_wn_wakeword_from_name(s_wn_name);
-                    ESP_LOGI(TAG, "WakeNet %s ready, chunk=%d samples, rate=%d, word=%s",
-                             s_wn_name, s_wn_chunk, s_wn->get_samp_rate(s_wn_data),
-                             ww ? ww : "?");
-                }
-            }
+        if (!afe_init_wake(models)) {
+            ESP_LOGW(TAG, "AFE wake init failed, fallback raw WakeNet");
         }
-    } else {
-        ESP_LOGE(TAG, "No WakeNet packed in model partition");
     }
 
-    xTaskCreatePinnedToCore(session_task, "session_task", 8192, NULL, 5, NULL, 1);
-    xTaskCreatePinnedToCore(player_task,  "player_task",  4096, NULL, 4, NULL, 1);
-    ESP_LOGI(TAG, "Voice session initialized (device=%s)", s_device);
+    if (!afe_init_vc(models)) {
+        ESP_LOGW(TAG, "AFE vc init failed, uplink will be raw PCM + RMS VAD");
+    }
+
+    if (s_afe_wake == NULL && s_wn_name[0]) {
+        s_wn = esp_wn_handle_from_name(s_wn_name);
+        if (s_wn) {
+            s_wn_data = s_wn->create(s_wn_name, DET_MODE_90);
+            if (s_wn_data) {
+                s_wn_chunk = s_wn->get_samp_chunksize(s_wn_data);
+                ESP_LOGI(TAG, "Raw WakeNet %s ready, chunk=%d", s_wn_name, s_wn_chunk);
+            } else {
+                s_wn = NULL;
+            }
+        }
+    }
+
+    afe_set_pipe(AFE_PIPE_WAKE);
+
+    xTaskCreatePinnedToCore(session_task, "session_task", 8192, NULL, 5, NULL, 0);
+    xTaskCreatePinnedToCore(afe_fetch_task, "afe_fetch", 4096, NULL, 4, NULL, 1);
+    xTaskCreatePinnedToCore(player_task, "player_task", 4096, NULL, 4, NULL, 1);
+    ESP_LOGI(TAG, "Voice session initialized (device=%s afe_wake=%d afe_vc=%d)",
+             s_device, s_afe_wake != NULL, s_afe_vc != NULL);
     return ESP_OK;
 }

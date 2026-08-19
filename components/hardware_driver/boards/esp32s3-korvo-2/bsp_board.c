@@ -15,7 +15,8 @@
  *      limitations under the License.
  */
 
-#include "string.h"
+#include <stdlib.h>
+#include <string.h>
 #include "bsp_board.h"
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
 #include "driver/i2s_std.h"
@@ -27,6 +28,8 @@
 #include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "driver/i2c_master.h"
 #include "esp_rom_sys.h"
 #include "esp_check.h"
@@ -316,59 +319,23 @@ static esp_err_t bsp_codec_deinit()
 
 esp_err_t bsp_audio_play(const int16_t* data, int length, TickType_t ticks_to_wait)
 {
-    size_t bytes_write = 0;
-    esp_err_t ret = ESP_OK;
-    if (!play_dev) {
+    (void)ticks_to_wait;
+    if (!play_dev || data == NULL || length <= 0) {
         return ESP_FAIL;
     }
 
-    int out_length= length;
-    int audio_time = 1;
-    audio_time *= (16000 / s_play_sample_rate);
-    audio_time *= (2 / s_play_channel_format);
-
-    int *data_out = NULL;
-    if (s_bits_per_chan != 32) {
-        out_length = length * 2;
-        data_out = malloc(out_length);
-        for (int i = 0; i < length / sizeof(int16_t); i++) {
-            int ret = data[i];
-            data_out[i] = ret << 16;
-        }
+    /* 应用层是 16-bit 单声道；I2S/ES8311 是 16-bit 立体声，复制到 L/R */
+    int n = length / (int)sizeof(int16_t);
+    int16_t *st = (int16_t *)malloc((size_t)n * 2 * sizeof(int16_t));
+    if (st == NULL) {
+        return ESP_ERR_NO_MEM;
     }
-
-    int *data_out_1 = NULL;
-    if (s_play_channel_format != 2 || s_play_sample_rate != 16000) {
-        out_length *= audio_time;
-        data_out_1 = malloc(out_length);
-        int *tmp_data = NULL;
-        if (data_out != NULL) {
-            tmp_data = data_out;
-        } else {
-            tmp_data = (int *)data;
-        }
-
-        for (int i = 0; i < out_length / (audio_time * sizeof(int)); i++) {
-            for (int j = 0; j < audio_time; j++) {
-                data_out_1[audio_time * i + j] = tmp_data[i];
-            }
-        }
-        if (data_out != NULL) {
-            free(data_out);
-            data_out = NULL;
-        }
+    for (int i = 0; i < n; i++) {
+        st[2 * i] = data[i];
+        st[2 * i + 1] = data[i];
     }
-
-    if (data_out != NULL) {
-        ret = esp_codec_dev_write(play_dev, (void *)data_out, out_length);
-        free(data_out);
-    } else if (data_out_1 != NULL) {
-        ret = esp_codec_dev_write(play_dev, (void *)data_out_1, out_length);
-        free(data_out_1);
-    } else {
-        ret = esp_codec_dev_write(play_dev, (void *)data, length);
-    }
-
+    esp_err_t ret = esp_codec_dev_write(play_dev, st, n * 2 * (int)sizeof(int16_t));
+    free(st);
     return ret;
 }
 
@@ -377,27 +344,61 @@ esp_err_t bsp_get_feed_data(bool is_get_raw_channel, int16_t *buffer, int buffer
     if (!record_dev) {
         return ESP_FAIL;
     }
-    if (is_get_raw_channel) {
-        return esp_codec_dev_read(record_dev, (void *)buffer, buffer_len);
-    }
 
-    /* 从 ES8311 立体声取出左声道（MIC）写成 mono */
     int mono_samples = buffer_len / (int)sizeof(int16_t);
     if (mono_samples <= 0) {
         return ESP_ERR_INVALID_ARG;
     }
-    static int16_t stereo[512 * ES8311_I2S_CH];
     if (mono_samples > 512) {
         mono_samples = 512;
     }
+
+    static int16_t stereo[512 * ES8311_I2S_CH];
     int stereo_bytes = mono_samples * ES8311_I2S_CH * (int)sizeof(int16_t);
     esp_err_t ret = esp_codec_dev_read(record_dev, stereo, stereo_bytes);
     if (ret != ESP_OK) {
         return ret;
     }
+
+    uint32_t abs_l = 0, abs_r = 0, peak_l = 0, peak_r = 0;
     for (int i = 0; i < mono_samples; i++) {
-        buffer[i] = stereo[i * ES8311_I2S_CH];
+        int16_t l = stereo[i * ES8311_I2S_CH];
+        int16_t r = stereo[i * ES8311_I2S_CH + 1];
+        buffer[i] = l;
+        int vl = l, vr = r;
+        uint32_t al = (uint32_t)(vl < 0 ? -vl : vl);
+        uint32_t ar = (uint32_t)(vr < 0 ? -vr : vr);
+        abs_l += al;
+        abs_r += ar;
+        if (al > peak_l) peak_l = al;
+        if (ar > peak_r) peak_r = ar;
     }
+
+    static bool dumped;
+    if (!dumped) {
+        dumped = true;
+        ESP_LOGI(TAG, "adc raw L=%d R=%d  L2=%d R2=%d",
+                 (int)stereo[0], (int)stereo[1], (int)stereo[2], (int)stereo[3]);
+    }
+
+    static uint32_t acc_l, acc_r, pk_l, pk_r, frames;
+    static TickType_t t_log;
+    acc_l += abs_l / (uint32_t)mono_samples;
+    acc_r += abs_r / (uint32_t)mono_samples;
+    if (peak_l > pk_l) pk_l = peak_l;
+    if (peak_r > pk_r) pk_r = peak_r;
+    frames++;
+    TickType_t now = xTaskGetTickCount();
+    if (t_log == 0 || (now - t_log) >= pdMS_TO_TICKS(1000)) {
+        ESP_LOGI(TAG, "adc L|avg|=%u peak=%u  R|avg|=%u peak=%u  frames=%u",
+                 (unsigned)(frames ? acc_l / frames : 0), (unsigned)pk_l,
+                 (unsigned)(frames ? acc_r / frames : 0), (unsigned)pk_r,
+                 (unsigned)frames);
+        acc_l = acc_r = pk_l = pk_r = frames = 0;
+        t_log = now;
+    }
+
+    (void)is_get_raw_channel;
     return ESP_OK;
 }
 
@@ -415,23 +416,16 @@ esp_err_t bsp_board_init(uint32_t sample_rate, int channel_format, int bits_per_
 {
     /*!< Initialize I2C bus, used for audio codec*/
     bsp_i2c_init(I2C_NUM, I2C_CLK);
-    s_play_sample_rate = sample_rate;
+    (void)sample_rate;
+    (void)channel_format;
+    (void)bits_per_chan;
+    /* 与小智一致：16 kHz / 16-bit / 立体声，应用层再下混成单声道 */
+    s_play_sample_rate = 16000;
+    s_play_channel_format = 2;
+    s_bits_per_chan = 16;
 
-    if (channel_format != 2 && channel_format != 1) {
-        ESP_LOGE(TAG, "Unable to configure channel_format");
-        channel_format = 2;
-    }
-    s_play_channel_format = channel_format;
-
-    if (bits_per_chan != 32 && bits_per_chan != 16) {
-        ESP_LOGE(TAG, "Unable to configure bits_per_chan");
-        bits_per_chan = 32;
-    }
-    s_bits_per_chan = bits_per_chan;
-
-    bsp_i2s_init(I2S_NUM_1, 16000, 2, 32);
-    // Because record and play use the same i2s.
-    bsp_codec_init(16000, 16000, 2, 32);
+    bsp_i2s_init(I2S_NUM_1, 16000, 2, 16);
+    bsp_codec_init(16000, 16000, 2, 16);
     /* Initialize PA */
     // gpio_config_t  io_conf;
     // memset(&io_conf, 0, sizeof(io_conf));

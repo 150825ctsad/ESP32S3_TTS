@@ -15,13 +15,23 @@ esp_err_t ws_cfg_init(void);
 /**
  * @brief 保存 WebSocket 地址（mqtt_cfg 收到 /ws/ 路径时调用）
  *
- * 仅保存地址，不连接 —— 唤醒时才建立连接（连接生命周期 = 一次会话）。
  * 内部把 https:// 归一化为 wss://。
  */
 esp_err_t ws_cfg_set_uri(const char *uri);
 
 /** @brief 是否已有可用的 WebSocket 地址 */
 bool ws_cfg_has_uri(void);
+
+/**
+ * @brief 云端下发 ws 后立刻发起一次 TTS 播放会话（不走麦克风上行）
+ *
+ * 播完后通过 ws_cfg_set_push_done_cb 回调 msgId。
+ * 若当前正在语音会话中，会等到回到 IDLE 再连接。
+ */
+esp_err_t ws_cfg_request_push(const char *msg_id, const char *tts_text);
+
+typedef void (*ws_cfg_push_done_cb_t)(const char *msg_id, bool ok);
+void ws_cfg_set_push_done_cb(ws_cfg_push_done_cb_t cb);
 
 /**
  * @brief 播放 voice_data 分区中的提示音 WAV（16kHz/16bit/mono）

@@ -9,7 +9,7 @@
  *   1. 连接后立即上报设备ID（QoS2, retained）
  *   2. 周期上报 WiFi 信息（环境数据）
  *   3. 下发 {"vol":50} → 设置音量 → 返回 {"vol":"ok","value":50}
- *   4. 下发含 /ws/ 路径字段 → 保存 WebSocket 地址供 ws_cfg 使用（唤醒时才连接）
+ *   4. 下发含 /ws/ 路径字段 → 保存地址并立刻连 WS 播 TTS，播完返回 {"msgId":"..."}
  ******************************************************************************/
 #include <stdio.h>
 #include <string.h>
@@ -28,7 +28,7 @@
 #include "cJSON.h"
 
 #define TAG                    "MQTT_CLIENT"
-#define MQTT_BROKER_URI        "mqtt://192.168.1.200" //mqtt:mqtt-xiaoyi.gejia.tech wss:https://iot-xiaoyi.gejia.tech
+#define MQTT_BROKER_URI        "mqtt://mqtt-xiaoyi.gejia.tech" //mqtt:mqtt-xiaoyi.gejia.tech wss:https://iot-xiaoyi.gejia.tech
 #define MQTT_BROKER_PORT       1883
 
 #define MQTT_USERNAME          "esp32s3"
@@ -110,6 +110,25 @@ static void publish_wifi_info(void)
     }
 }
 
+/* 云端 TTS 播完 → 把下发的 msgId 回传 */
+static void on_push_tts_done(const char *msg_id, bool ok)
+{
+    if (!mqtt_connected || mqtt_client == NULL || msg_id == NULL || !msg_id[0]) {
+        return;
+    }
+    cJSON *root = cJSON_CreateObject();
+    if (root == NULL) return;
+    cJSON_AddStringToObject(root, "msgId", msg_id);
+    cJSON_AddStringToObject(root, "tts", ok ? "ok" : "fail");
+    char *js = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (js == NULL) return;
+    int len = (int)strlen(js);
+    esp_mqtt_client_publish(mqtt_client, mqtt_topic_data, js, len, 1, 0);
+    ESP_LOGI(TAG, "Push done ack: %s", js);
+    cJSON_free(js);
+}
+
 /* ================================================================ */
 /*  下行：指令处理                                                   */
 /* ================================================================ */
@@ -142,7 +161,15 @@ static void handle_command(const char *msg_str)
         }
     }
 
-    /* 如果 cmd 返回了以 /ws/ 开头的路径，拼接为完整 websocket 地址并保存（不连接，唤醒时才连） */
+    /* 含 /ws/ 路径：保存地址并立刻连 WS 播放，完成后回传 msgId */
+    const char *msgid = NULL;
+    const char *tts_text = NULL;
+    cJSON *jmsgid = cJSON_GetObjectItemCaseSensitive(root, "msgId");
+    if (cJSON_IsString(jmsgid) && jmsgid->valuestring) msgid = jmsgid->valuestring;
+    cJSON *jtts = cJSON_GetObjectItemCaseSensitive(root, "tts");
+    if (cJSON_IsString(jtts) && jtts->valuestring) tts_text = jtts->valuestring;
+
+    bool got_ws = false;
     cJSON *iter = NULL;
     cJSON_ArrayForEach(iter, root) {
         if (cJSON_IsString(iter) && iter->valuestring != NULL) {
@@ -151,10 +178,15 @@ static void handle_command(const char *msg_str)
                 int n = snprintf(full_ws, sizeof(full_ws), "https://iot-xiaoyi.gejia.tech%s", iter->valuestring);
                 if (n > 0 && n < (int)sizeof(full_ws)) {
                     ESP_LOGI(TAG, "Detected ws path in cmd (field=%s): %s", iter->string ? iter->string : "<anon>", full_ws);
-                    ws_cfg_set_uri(full_ws);
+                    if (ws_cfg_set_uri(full_ws) == ESP_OK) {
+                        got_ws = true;
+                    }
                 }
             }
         }
+    }
+    if (got_ws) {
+        ws_cfg_request_push(msgid, tts_text);
     }
 
     cJSON_Delete(root);
@@ -261,6 +293,7 @@ static void mqtt_start(void)
         ESP_LOGE(TAG, "MQTT client init failed");
         return;
     }
+    ws_cfg_set_push_done_cb(on_push_tts_done);
     esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_callback, NULL);
     esp_err_t err = esp_mqtt_client_start(mqtt_client);
     if (err != ESP_OK) {

@@ -15,6 +15,7 @@ extern "C" {
 #define WS_EVT_DISCONNECTED (1 << 1)   /* WS 断开（非主动） */
 #define WS_EVT_TTS_DONE     (1 << 2)   /* 收到 {"type":"done"} */
 #define WS_EVT_TTS_ERROR    (1 << 3)   /* 收到 {"type":"error"} */
+#define SESS_EVT_PUSH       (1 << 10)  /* MQTT 下发 ws，请求立刻连云端播 TTS */
 
 /**
  * @brief 注入会话事件组与下行音频缓冲（voice_session 初始化时调用）

@@ -366,15 +366,29 @@ esp_err_t bsp_board_init(uint32_t sample_rate, int channel_format, int bits_per_
 
 esp_err_t bsp_audio_play(const int16_t *data, int length, TickType_t ticks_to_wait)
 {
-    if (play_dev == NULL) {
+    (void)ticks_to_wait;
+    if (play_dev == NULL || data == NULL || length <= 0) {
         return ESP_FAIL;
     }
+
+    /* 禁止就地改写调用方缓冲：welcome.wav 在 flash mmap，写入会 Cache error 重启 */
+    static int16_t scratch[512];
+    const uint8_t *src = (const uint8_t *)data;
+    int remaining = length;
+    while (remaining > 0) {
+        int n = remaining > (int)sizeof(scratch) ? (int)sizeof(scratch) : remaining;
+        memcpy(scratch, src, (size_t)n);
 #if AUDIO_PREPROCESS_EN
-    /* esp_codec_dev 的软件音量本就会就地改写该缓冲(要求 RAM 可写)，
-     * EQ/增益同样就地处理，零额外内存 */
-    audio_preprocess((int16_t *)data, length / sizeof(int16_t));
+        audio_preprocess(scratch, n / (int)sizeof(int16_t));
 #endif
-    return esp_codec_dev_write(play_dev, (void *)data, length);
+        esp_err_t ret = esp_codec_dev_write(play_dev, scratch, n);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        src += n;
+        remaining -= n;
+    }
+    return ESP_OK;
 }
 
 esp_err_t bsp_audio_set_play_vol(int volume)
