@@ -70,11 +70,6 @@ esp_err_t esp_audio_get_play_vol(int *volume)
     return bsp_audio_get_play_vol(volume);
 }
 
-esp_err_t esp_audio_flush(void)
-{
-    return bsp_audio_flush();
-}
-
 esp_err_t FatfsComboWrite(const void* buffer, int size, int count, FILE* stream)
 {
     esp_err_t res = ESP_OK;

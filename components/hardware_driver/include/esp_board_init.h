@@ -99,7 +99,6 @@ esp_err_t esp_audio_set_play_vol(int volume);
  *    - Others: Fail
  */
 esp_err_t esp_audio_get_play_vol(int *volume);
-esp_err_t esp_audio_flush(void);
 
 
 esp_err_t FatfsComboWrite(const void* buffer, int size, int count, FILE* stream);

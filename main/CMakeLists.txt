@@ -1,15 +1,13 @@
-﻿idf_component_register( SRCS 
+idf_component_register( SRCS
                         "main.c"
 
-                        INCLUDE_DIRS 
+                        INCLUDE_DIRS
                         "."
 
-                        REQUIRES 
+                        REQUIRES
                         button
                         relay
-                        button
                         wifi_cfg
-                        TTS
-                        sr_ringbuf 
-                        hardware_driver
-                        recorder)
+                        ws_cfg
+                        sr_ringbuf
+                        hardware_driver)

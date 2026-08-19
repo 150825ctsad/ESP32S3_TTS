@@ -9,11 +9,9 @@
 #include "esp_board_init.h"
 
 #include <math.h>
-#include "TTS.h"
 #include "wifi_cfg.h"
-#include "relay.h"
 #include "button.h"
-#include "recorder.h"
+#include "ws_cfg.h"
 
 // /* Quick 1 kHz test tone — purely I2S path verification, no TTS */
 // static void test_beep(void)
@@ -29,29 +27,25 @@
 //     printf("BEEP: writing %d samples at %d Hz\n", nsamp, freq);
 //     esp_err_t r = esp_audio_play(buf, nsamp * sizeof(int16_t), portMAX_DELAY);
 //     printf("BEEP: write ret=%d\n", r);
-//     esp_audio_flush();
 //     free(buf);
 // }
 
 int app_main()
 {
-    //relay_init();
     ESP_ERROR_CHECK(esp_board_init(16000, 1, 16));
 
     button_init();
     vTaskDelay(1000);
 
-//   test_beep();  /* ← 临时启用：1kHz 测试音，绕过 TTS，验证 I2S/功放 */
+    /* 语音会话：WakeNet 唤醒监听立即开始（网络就绪前唤醒无效，会有提示音） */
+    ws_cfg_init();
 
-    if (tts_init() != ESP_OK) return 0;
-
-    //recorder_init();  /* VAD 触发录音 + MQTT 上传 */
-
+    /* 非阻塞 WiFi：GOT_IP 后 wifi_cfg 自动拉起 mqtt_task（环境数据上报 + /ws/ 地址） */
     wifi_init();
     vTaskDelay(1000);
 
-    /* 非阻塞播报启动提示 —— TTS 任务已就绪 */
-    tts_speak_async("欢迎使用乐鑫语音合成");
+    /* 阻塞播放开机提示音（voice_data 分区 WAV） */
+    ws_cfg_play_tone();
 
     while(1){
         vTaskDelay(1000);
