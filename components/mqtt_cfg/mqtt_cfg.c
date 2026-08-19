@@ -2,7 +2,7 @@
  *
  * 主题设计：
  *   cmd/<mac>    下行指令（设备订阅 QoS1）：{"tts":"文本"} / {"vol":50}
- *   data/<mac>   上行WiFi信息（设备发布 QoS0）
+ *   status/<mac>   上行WiFi信息（设备发布 QoS0）
  *   audio/<mac>  上行音频（Base64 PCM）(未实现)
  *   online       上线通知（通用主题，QoS2，retained，消息体含 device 字段）
  *
@@ -41,7 +41,7 @@ static char mqtt_client_id[13] = "000000000000";
 
 /* 设备专属主题 */
 static char mqtt_topic_cmd[24];        /* "cmd/b81f3fb86280"   下行指令 */
-static char mqtt_topic_data[24];      /* "data/b81f3fb86280"  上行WiFi信息 */
+static char mqtt_topic_data[24];      /* "status/b81f3fb86280"  上行WiFi信息 */
 static char mqtt_topic_audio[24];     /* "audio/b81f3fb86280" 上行音频 */
 /* online 为通用主题，所有设备共用，消息体中携带 device 字段区分 */
 #define MQTT_TOPIC_ONLINE  "online"
@@ -177,6 +177,21 @@ static void handle_command(const char *msg_str)
         }
     }
 
+    /* 如果 cmd 返回了以 /ws/ 开头的路径，拼接为完整 websocket 地址并记录 */
+    cJSON *iter = NULL;
+    cJSON_ArrayForEach(iter, root) {
+        if (cJSON_IsString(iter) && iter->valuestring != NULL) {
+            if (strncmp(iter->valuestring, "/ws/", 4) == 0) {
+                char full_ws[256];
+                int n = snprintf(full_ws, sizeof(full_ws), "https://iot-xiaoyi.gejia.tech%s", iter->valuestring);
+                if (n > 0 && n < (int)sizeof(full_ws)) {
+                    ESP_LOGI(TAG, "Detected ws path in cmd (field=%s): %s", iter->string ? iter->string : "<anon>", full_ws);
+                    /* TODO: 若需要，打开 websocket 或将地址保存以供其它组件使用 */
+                }
+            }
+        }
+    }
+
     cJSON_Delete(root);
 }
 
@@ -304,9 +319,9 @@ void mqtt_task(void *pvParameters)
                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     }
     snprintf(mqtt_topic_cmd,    sizeof(mqtt_topic_cmd),    "cmd/%s",    mqtt_client_id);
-    snprintf(mqtt_topic_data,   sizeof(mqtt_topic_data),   "data/%s",   mqtt_client_id);
+    snprintf(mqtt_topic_data,   sizeof(mqtt_topic_data),   "status/%s",   mqtt_client_id);
     snprintf(mqtt_topic_audio,  sizeof(mqtt_topic_audio),  "audio/%s",  mqtt_client_id);
-    ESP_LOGI(TAG, "Client ID: %s | cmd: %s | data: %s | online: %s",
+    ESP_LOGI(TAG, "Client ID: %s | cmd: %s | status: %s | online: %s",
              mqtt_client_id, mqtt_topic_cmd, mqtt_topic_data, MQTT_TOPIC_ONLINE);
 
     /* 注册 TTS 播报完成回调 */
