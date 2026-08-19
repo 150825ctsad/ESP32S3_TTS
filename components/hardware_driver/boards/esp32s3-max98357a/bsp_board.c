@@ -78,63 +78,6 @@ static void audio_preprocess(int16_t *pcm, int n)
     }
 }
 
-/* ------------------------------------------------------------------ */
-/*  音频预处理：EQ + 数字增益 + 软限幅                                 */
-/*  - 200Hz 高通：削减低频嗡声，保护小喇叭                             */
-/*  - 3kHz 峰化 +6dB：提升人声音频段(1~4kHz)清晰度                     */
-/*  - 数字增益 +4dB，软限幅防止削波破音                                */
-/* ------------------------------------------------------------------ */
-#define AUDIO_PREPROCESS_EN   1
-#define AUDIO_PRE_GAIN        1.6f     /* ≈ +4.1dB */
-
-typedef struct {
-    float b0, b1, b2, a1, a2;   /* 归一化系数 (RBJ cookbook) */
-    float x1, x2, y1, y2;       /* 延迟单元 */
-} biquad_t;
-
-static biquad_t s_hpf = {  /* 高通 200Hz, Q=0.707, fs=16kHz */
-    .b0 = 0.94597556f, .b1 = -1.89195112f, .b2 = 0.94597556f,
-    .a1 = -1.88903308f, .a2 = 0.89487432f,
-};
-static biquad_t s_peq = {  /* 峰化 3kHz, +6dB, Q=0.707, fs=16kHz */
-    .b0 = 1.31476723f, .b1 = -0.52333896f, .b2 = 0.05275853f,
-    .a1 = -0.52333896f, .a2 = 0.36753022f,
-};
-
-static inline float biquad_process(biquad_t *s, float x)
-{
-    float y = s->b0 * x + s->b1 * s->x1 + s->b2 * s->x2
-                        - s->a1 * s->y1 - s->a2 * s->y2;
-    s->x2 = s->x1; s->x1 = x;
-    s->y2 = s->y1; s->y1 = y;
-    return y;
-}
-
-/* 软拐点限幅：-2dBFS(≈26000) 以下线性，以上 4:1 压缩 */
-static inline int16_t soft_clip(int32_t x)
-{
-    const int32_t th = 26000;
-    if (x > th) {
-        x = th + (x - th) / 4;
-        if (x > 32767) x = 32767;
-    } else if (x < -th) {
-        x = -th + (x + th) / 4;
-        if (x < -32768) x = -32768;
-    }
-    return (int16_t)x;
-}
-
-static void audio_preprocess(int16_t *pcm, int n)
-{
-    for (int i = 0; i < n; i++) {
-        float x = (float)pcm[i];
-        x = biquad_process(&s_hpf, x);
-        x = biquad_process(&s_peq, x);
-        x *= AUDIO_PRE_GAIN;
-        pcm[i] = soft_clip((int32_t)x);
-    }
-}
-
 static const char *TAG = "MAX98357A";
 static int s_play_sample_rate = 16000;
 static int s_play_channel_format = 1;
@@ -167,18 +110,9 @@ static esp_err_t bsp_i2s_init(i2s_port_t i2s_num, uint32_t sample_rate,
      * 用 32-bit STEREO slot：32×2 = 64 BCLK/帧，满足 MSM261 要求。
      * MAX98357A 只取高 16 位，32-bit slot 也能正常工作。 */
     i2s_slot_mode_t slot_mode = I2S_SLOT_MODE_STEREO;
-    if (channel_format != 1 && channel_format != 2) {
-        ESP_LOGW(TAG, "Unsupported channel_format %d, fallback to stereo", channel_format);
-    }
+    int slot_bits = 32;   /* 统一 32-bit slot，兼容 24-bit 麦克风和 16-bit 功放 */
 
-    if (bits_per_chan != 16 && bits_per_chan != 24 && bits_per_chan != 32) {
-        ESP_LOGW(TAG, "Unsupported bits_per_chan %d, fallback to 16", bits_per_chan);
-        bits_per_chan = 16;
-    }
-
-    /* DMA 缓冲 8 x 480 帧 = 3840 帧 ≈ 240ms @16kHz（默认仅 90ms），
-     * 吸收 TTS 流式合成的速度抖动，防止欠载破音。
-     * 注意：若调整此处，需同步调整 bsp_audio_flush 的静音长度。 */
+    /* DMA 缓冲 8 x 480 帧 = 3840 帧 ≈ 240ms @16kHz */
     i2s_chan_config_t chan_cfg = {
         .id            = i2s_num,
         .role          = I2S_ROLE_MASTER,
@@ -186,10 +120,44 @@ static esp_err_t bsp_i2s_init(i2s_port_t i2s_num, uint32_t sample_rate,
         .dma_frame_num = 480,
         .auto_clear    = true,
     };
-    ret_val |= i2s_new_channel(&chan_cfg, &tx_handle, NULL);  // TX only
+    /* 同时创建 TX 和 RX 通道（全双工） */
+    ret_val |= i2s_new_channel(&chan_cfg, &tx_handle, &rx_handle);
 
-    i2s_std_config_t std_cfg = I2S_CONFIG_DEFAULT(sample_rate, slot_mode, bits_per_chan);
-    ret_val |= i2s_channel_init_std_mode(tx_handle, &std_cfg);
+    /* TX: 32-bit slot，数据位宽 16-bit（高 16 位有效） */
+    i2s_std_config_t tx_cfg = {
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(slot_bits, slot_mode),
+        .gpio_cfg = {
+            .mclk = GPIO_I2S_MCLK,
+            .bclk = GPIO_I2S_SCLK,
+            .ws   = GPIO_I2S_LRCK,
+            .dout = GPIO_I2S_DOUT,
+            .din  = GPIO_I2S_SDIN,
+        },
+    };
+    /* TX slot 数据位宽设为 16-bit（在 32-bit slot 中） */
+    tx_cfg.slot_cfg.data_bit_width = bits_per_chan;
+    tx_cfg.slot_cfg.slot_bit_width = slot_bits;
+    ret_val |= i2s_channel_init_std_mode(tx_handle, &tx_cfg);
+
+    /* RX: 32-bit slot，数据位宽 24-bit（MSM261 输出 24-bit） */
+    i2s_std_config_t rx_cfg = {
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(slot_bits, slot_mode),
+        .gpio_cfg = {
+            .mclk = GPIO_I2S_MCLK,
+            .bclk = GPIO_I2S_SCLK,
+            .ws   = GPIO_I2S_LRCK,
+            .dout = GPIO_I2S_DOUT,
+            .din  = GPIO_I2S_SDIN,
+        },
+    };
+    rx_cfg.slot_cfg.data_bit_width = 24;
+    rx_cfg.slot_cfg.slot_bit_width = slot_bits;
+    /* MSM261 L/R 接 GND = 左声道，只收左 slot */
+    rx_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+    ret_val |= i2s_channel_init_std_mode(rx_handle, &rx_cfg);
+
     ret_val |= i2s_channel_enable(tx_handle);
     ret_val |= i2s_channel_enable(rx_handle);
 
@@ -406,11 +374,6 @@ esp_err_t bsp_audio_play(const int16_t *data, int length, TickType_t ticks_to_wa
      * EQ/增益同样就地处理，零额外内存 */
     audio_preprocess((int16_t *)data, length / sizeof(int16_t));
 #endif
-#if AUDIO_PREPROCESS_EN
-    /* esp_codec_dev 的软件音量本就会就地改写该缓冲(要求 RAM 可写)，
-     * EQ/增益同样就地处理，零额外内存 */
-    audio_preprocess((int16_t *)data, length / sizeof(int16_t));
-#endif
     return esp_codec_dev_write(play_dev, (void *)data, length);
 }
 
@@ -429,16 +392,9 @@ esp_err_t bsp_audio_get_play_vol(int *volume)
 /* 静音长度须 ≥ DMA 缓冲总时长(240ms)，才能保证残留语音全部流出到喇叭 */
 #define FLUSH_SILENCE_SAMPLES  4800   /* 300ms @16kHz */
 
-/* 静音长度须 ≥ DMA 缓冲总时长(240ms)，才能保证残留语音全部流出到喇叭 */
-#define FLUSH_SILENCE_SAMPLES  4800   /* 300ms @16kHz */
-
 esp_err_t bsp_audio_flush(void)
 {
     if (play_dev == NULL) return ESP_FAIL;
-    /* 不能加 const：esp_codec_dev 软件音量会就地改写该缓冲，
-     * const 数组位于 flash 映射区，写入会触发 Cache error panic */
-    static int16_t silence[FLUSH_SILENCE_SAMPLES];   /* .bss 零初始化 */
-    return esp_codec_dev_write(play_dev, (void *)silence, sizeof(silence));
     /* 不能加 const：esp_codec_dev 软件音量会就地改写该缓冲，
      * const 数组位于 flash 映射区，写入会触发 Cache error panic */
     static int16_t silence[FLUSH_SILENCE_SAMPLES];   /* .bss 零初始化 */
