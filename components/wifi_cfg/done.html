@@ -73,6 +73,25 @@ button:active{transform:translateY(1px)}
   var p = new URLSearchParams(location.search);
   var m = p.get('message');
   if (m) document.getElementById('message').textContent = m;
+
+  /* xiaozhi-style: leave config mode without reboot */
+  window.addEventListener('load', function() {
+    setTimeout(function() {
+      fetch('/exit', { method: 'POST' })
+        .then(function(response) {
+          if (response.ok) {
+            console.log('Exit config mode request sent');
+            var msg = document.getElementById('msg');
+            if (msg) msg.textContent = '设备正在连接 Wi-Fi，可关闭此页面。';
+          } else {
+            console.error('Failed to send exit request');
+          }
+        })
+        .catch(function(error) {
+          console.error('Error:', error);
+        });
+    }, 1000);
+  });
 })();
 </script>
 </body>

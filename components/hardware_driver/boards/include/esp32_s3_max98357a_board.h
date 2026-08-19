@@ -46,11 +46,18 @@
 #define GPIO_SDSPI_MOSI     (GPIO_NUM_NC)
 
 /**
- * @brief I2S pins for MAX98357A (TX only)
+ * @brief I2S pins for MAX98357A (TX) + MSM261S4030H0R (RX)
  *
- * These are commonly-used ESP32-S3 pins. Adjust to match your wiring.
+ * MAX98357A: BCLK, LRCK, DOUT
+ * MSM261:    BCLK(共用), WS(共用), SD(数据输出→DIN)
+ * 两设备共用 BCLK/WS，全双工工作在同一个 I2S 控制器上。
  */
 #define FUNC_I2S_EN         (1)
+#define GPIO_I2S_LRCK       (GPIO_NUM_40)   /* WS / word select（共用） */
+#define GPIO_I2S_MCLK       (GPIO_NUM_NC)   /* 无需 MCLK */
+#define GPIO_I2S_SCLK       (GPIO_NUM_41)   /* BCLK / bit clock（共用） */
+#define GPIO_I2S_SDIN       (GPIO_NUM_39)   /* MSM261 SD 数据输出 */
+#define GPIO_I2S_DOUT       (GPIO_NUM_42)   /* MAX98357A DIN */
 #define GPIO_I2S_LRCK       (GPIO_NUM_15)   /* WS / word select */
 #define GPIO_I2S_MCLK       (GPIO_NUM_NC)   /* MAX98357A has internal PLL, no MCLK needed */
 #define GPIO_I2S_SCLK       (GPIO_NUM_7)    /* BCLK / bit clock */
@@ -68,13 +75,15 @@
 #define GPIO_I2S0_DOUT       (GPIO_NUM_NC)
 
 /**
- * @brief Recording - not supported on this board
+ * @brief Recording - MSM261S4030H0R I2S MEMS microphone
+ * 24-bit 数据在 32-bit slot 中，左声道（L/R 接 GND）
  */
-#define RECORD_VOLUME   (0)
+#define RECORD_VOLUME   (50)
 
 /**
  * @brief Default playback volume (0-100)
  */
+#define PLAYER_VOLUME   (50)
 #define PLAYER_VOLUME   (75)
 
 /**

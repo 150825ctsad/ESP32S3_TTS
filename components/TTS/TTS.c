@@ -38,6 +38,7 @@
 /* ================================================================ */
 static esp_tts_handle_t *tts_handle = NULL;
 static QueueHandle_t     tts_queue = NULL;
+static tts_complete_cb_t tts_complete_cb = NULL;
 
 /* ================================================================ */
 /*  Fade in/out -- 消除每段语音首尾的咔哒爆音 (8ms @16kHz)           */
@@ -88,9 +89,12 @@ static void tts_speak(const char *text)
 
             /* stream_play 的内部缓冲下次调用即失效，必须拷贝 */
             int16_t *tmp = realloc(tail, len[0] * sizeof(short));
-            if (tmp == NULL) {       /* 内存不足则放弃淡出，直接写当前块 */
-                esp_audio_play(pcm, len[0] * (int)sizeof(short), portMAX_DELAY);
-                total_bytes += len[0] * (int)sizeof(short);
+            if (tmp == NULL) {       /* 内存不足：拷贝到栈缓冲再播放，避免写只读内部缓冲 */
+                static int16_t fallback[1024];
+                int copy_n = len[0] < 1024 ? len[0] : 1024;
+                memcpy(fallback, pcm, copy_n * sizeof(short));
+                esp_audio_play(fallback, copy_n * (int)sizeof(short), portMAX_DELAY);
+                total_bytes += copy_n * (int)sizeof(short);
                 tail_len = 0;
                 first = false;
                 continue;
@@ -120,6 +124,11 @@ static void tts_speak(const char *text)
     esp_err_t flush_ret = esp_audio_flush();
     if (flush_ret != ESP_OK) printf("TTS: flush err %d\n", flush_ret);
     esp_tts_stream_reset(tts_handle);
+
+    /* 播报完成回调 */
+    if (tts_complete_cb) {
+        tts_complete_cb(text);
+    }
 }
 
 /* ================================================================ */
@@ -146,7 +155,15 @@ void tts_speak_async(const char *text)
     char buf[TTS_TEXT_MAX + 1];
     strncpy(buf, text, TTS_TEXT_MAX);
     buf[TTS_TEXT_MAX] = '\0';
-    xQueueSend(tts_queue, buf, 0);
+    if (xQueueSend(tts_queue, buf, 0) != pdTRUE) {
+        printf("TTS: queue full, message dropped\n");
+    }
+}
+
+/* ---- set complete callback ---- */
+void tts_set_complete_callback(tts_complete_cb_t cb)
+{
+    tts_complete_cb = cb;
 }
 
 /* ---- one-time init: load voice, create queue + task ---- */
@@ -184,3 +201,4 @@ esp_err_t tts_init(void)
 
     return ESP_OK;
 }
+
