@@ -52,24 +52,23 @@ static void ws_event_cb(void *arg, esp_event_base_t base,
         break;
 
     case WEBSOCKET_EVENT_ERROR:
-        if (data && data->error_handle) {
+        if (data) {
             ESP_LOGE(TAG, "WS error: sock_errno=%d",
-                     data->error_handle->esp_transport_sock_errno);
+                     data->error_handle.esp_transport_sock_errno);
         }
         break;
 
     case WEBSOCKET_EVENT_DATA: {
-        if (data == NULL || data->opaque_data == NULL || data->opaque_data_len == 0) {
-            /* 超大帧分片读取（协议约定帧 ≤ WS_BUFFER_SIZE，正常不会走到） */
-            ESP_LOGW(TAG, "Fragmented frame (payload_len=%d) not supported", data ? data->payload_len : -1);
+        if (data == NULL || data->data_ptr == NULL || data->data_len == 0) {
+            /* 控制帧（ping/pong/close）或超大帧分片，payload 为空 */
             break;
         }
 
-        if (data->opcode == WS_OPCODE_TEXT) {
+        if (data->op_code == WS_TRANSPORT_OPCODES_TEXT) {
             /* 文本帧 = JSON 控制消息 */
-            cJSON *root = cJSON_ParseWithLength(data->opaque_data, data->opaque_data_len);
+            cJSON *root = cJSON_ParseWithLength(data->data_ptr, data->data_len);
             if (root == NULL) {
-                ESP_LOGW(TAG, "Bad JSON: %.*s", data->opaque_data_len, data->opaque_data);
+                ESP_LOGW(TAG, "Bad JSON: %.*s", data->data_len, data->data_ptr);
                 break;
             }
             cJSON *type = cJSON_GetObjectItemCaseSensitive(root, "type");
@@ -78,19 +77,19 @@ static void ws_event_cb(void *arg, esp_event_base_t base,
                     ESP_LOGI(TAG, "Received done");
                     if (s_evt) xEventGroupSetBits(s_evt, WS_EVT_TTS_DONE);
                 } else if (strcmp(type->valuestring, "error") == 0) {
-                    ESP_LOGW(TAG, "Received error: %.*s", data->opaque_data_len, data->opaque_data);
+                    ESP_LOGW(TAG, "Received error: %.*s", data->data_len, data->data_ptr);
                     if (s_evt) xEventGroupSetBits(s_evt, WS_EVT_TTS_ERROR);
                 } else if (strcmp(type->valuestring, "tts_start") == 0) {
                     ESP_LOGI(TAG, "Received tts_start");
                 } else {
-                    ESP_LOGI(TAG, "Unknown control: %.*s", data->opaque_data_len, data->opaque_data);
+                    ESP_LOGI(TAG, "Unknown control: %.*s", data->data_len, data->data_ptr);
                 }
             }
             cJSON_Delete(root);
-        } else {
+        } else if (data->op_code == WS_TRANSPORT_OPCODES_BINARY ||
+                   data->op_code == WS_TRANSPORT_OPCODES_CONT) {
             /* 二进制帧 = PCM16 音频 → 播放缓冲（非阻塞，满则丢弃） */
-            int n = rb_write(s_ring, (char *)data->opaque_data,
-                             data->opaque_data_len, 0);
+            int n = rb_write(s_ring, (char *)data->data_ptr, data->data_len, 0);
             if (n < 0) {
                 ESP_LOGW(TAG, "Ring write failed (%d), pcm dropped", n);
             }
@@ -166,8 +165,8 @@ esp_err_t ws_cfg_connect(void)
         ESP_LOGE(TAG, "WS client init failed");
         return ESP_FAIL;
     }
-    esp_websocket_client_register_events(s_client, ESP_EVENT_ANY_ID,
-                                         ws_event_cb, NULL);
+    esp_websocket_register_events(s_client, WEBSOCKET_EVENT_ANY,
+                                  ws_event_cb, NULL);
     if (esp_websocket_client_start(s_client) != ESP_OK) {
         ESP_LOGE(TAG, "WS client start failed");
         esp_websocket_client_destroy(s_client);

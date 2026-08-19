@@ -1,16 +1,15 @@
 /* voice_session.c  -- 语音会话状态机
  *
- * 唤醒词 → WS 连接（唤醒才连，会话结束即断）→ 上行 PCM（云端 ASR）
- * → 下行 TTS PCM → 本地播放 → 回 IDLE 重新监听唤醒词。
+ * 唤醒词（你好小易）→ 云端 WS：上行 PCM → 下行 TTS PCM → 回 IDLE。
  *
  * 状态机：
- *   IDLE ──wakenet命中──▶ CONNECTING ──连接成功──▶ STREAMING ──VAD静音/10s上限──▶ WAIT_TTS
+ *   IDLE ──wakenet命中──▶ CONNECTING ──连接成功──▶ STREAMING ──VAD静音/10s──▶ WAIT_TTS
  *     ▲                       │(3s超时/失败: 提示音) │                          │(5s超时)
  *     │                       │                      ▼                          │
  *     └── done/error/断线 ◀── PLAYING ◀──────── 收到首字节 PCM ◀───────────────┘
  *
  * 任务划分：
- *   session_task: mic 读取（3ch 交错 → mono）+ WakeNet + 上行组帧 + VAD + 状态机
+ *   session_task: mic 读取 → WakeNet + 上行组帧 + VAD + 状态机
  *   player_task : rb_read → esp_audio_play（rb_reset 仅本任务执行）
  *
  * 下行缓冲（ring）排空握手：
@@ -29,6 +28,9 @@
 #include "esp_board_init.h"
 #include "esp_wn_iface.h"
 #include "esp_wn_models.h"
+#include "model_path.h"
+#include "sdkconfig.h"
+#include "esp_heap_caps.h"
 #include "ringbuf.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -36,10 +38,11 @@
 
 #define TAG "VOICE_SESSION"
 
-#define WAKE_MODEL_NAME      "wn9s_hilexin"   /* 唤醒词：嗨，乐鑫（无 PSRAM 用小模型） */
+#define SR_CHUNK_MAX         2048             /* WakeNet 单帧上限 */
 
 /* 音频参数 */
-#define MIC_CHANNELS         3                /* KORVO-2 输出 3 通道交错 [M,N,R] */
+#define MIC_CH_MAX           4
+#define MIC_FRAME_SAMPLES    240              /* 一次读取的采样数 */
 #define PCM_FRAME_SAMPLES    512              /* 上行 PCM 帧：512 采样 = 1024B = 32ms */
 
 /* 环形缓冲：下行 TTS 音频（WS 回调写 → player 读） */
@@ -69,7 +72,8 @@ static ringbuf_handle_t s_ring = NULL;
 
 static const esp_wn_iface_t *s_wn = NULL;
 static model_iface_data_t *s_wn_data = NULL;
-static int s_wn_chunk = 0;                    /* wakenet 每次喂入的采样数（运行时查询） */
+static int s_wn_chunk = 0;
+static char s_wn_name[64] = {0};
 
 static volatile sess_state_t s_state = SESS_IDLE;
 static char s_device[13] = "000000000000";
@@ -118,9 +122,9 @@ static void player_task(void *arg)
 
 static void session_task(void *arg)
 {
-    int16_t frame[240 * MIC_CHANNELS];   /* 一次 bsp_get_feed_data 的 3ch 交错数据 */
-    int16_t mono[512];                   /* 单声道 */
-    int16_t wn_buf[1024];                /* wakenet 累积缓冲 */
+    static int16_t frame[MIC_FRAME_SAMPLES * MIC_CH_MAX];
+    static int16_t mono[512];
+    static int16_t wn_buf[SR_CHUNK_MAX];
     int wn_n = 0;
     int16_t tx_frame[PCM_FRAME_SAMPLES]; /* 上行组帧 */
     int tx_n = 0;
@@ -128,16 +132,18 @@ static void session_task(void *arg)
     TickType_t t_connect_start = 0, t_stream_start = 0, t_wait_start = 0, t_play_start = 0;
 
     for (;;) {
-        int ret = esp_get_feed_data(false, frame, sizeof(frame));
-        if (ret <= 0) {
+        int ch = esp_get_feed_channel();
+        if (ch < 1) ch = 1;
+        if (ch > MIC_CH_MAX) ch = MIC_CH_MAX;
+        int nbytes = MIC_FRAME_SAMPLES * ch * (int)sizeof(int16_t);
+        if (esp_get_feed_data(false, frame, nbytes) != ESP_OK) {
             vTaskDelay(pdMS_TO_TICKS(5));
             continue;
         }
 
-        /* 3ch 交错 [M,N,R] → 取第一通道 M 为 mono */
-        int nsamp = ret / (2 * MIC_CHANNELS);
+        int nsamp = MIC_FRAME_SAMPLES;
         if (nsamp > (int)(sizeof(mono) / sizeof(mono[0]))) nsamp = sizeof(mono) / sizeof(mono[0]);
-        for (int i = 0; i < nsamp; i++) mono[i] = frame[3 * i];
+        for (int i = 0; i < nsamp; i++) mono[i] = frame[ch * i];
 
         switch (s_state) {
 
@@ -147,10 +153,15 @@ static void session_task(void *arg)
                 for (int i = 0; i < nsamp && wn_n < (int)(sizeof(wn_buf) / sizeof(wn_buf[0])); i++) {
                     wn_buf[wn_n++] = mono[i];
                 }
-                if (wn_n >= s_wn_chunk) {
-                    wn_n = 0;
+                if (s_wn_chunk > 0 && wn_n >= s_wn_chunk) {
+                    int leftover = wn_n - s_wn_chunk;
                     if (s_wn->detect(s_wn_data, wn_buf) == WAKENET_DETECTED) {
+                        if (leftover > 0) {
+                            memmove(wn_buf, wn_buf + s_wn_chunk, leftover * sizeof(int16_t));
+                        }
+                        wn_n = leftover;
                         ESP_LOGI(TAG, "!!! Wake word detected !!!");
+                        wn_n = 0;
                         if (!ws_cfg_has_uri()) {
                             ESP_LOGW(TAG, "No ws uri yet, tone and ignore");
                             ws_cfg_play_tone();
@@ -165,6 +176,11 @@ static void session_task(void *arg)
                         } else {
                             ws_cfg_play_tone();
                         }
+                    } else {
+                        if (leftover > 0) {
+                            memmove(wn_buf, wn_buf + s_wn_chunk, leftover * sizeof(int16_t));
+                        }
+                        wn_n = leftover;
                     }
                 }
             }
@@ -176,8 +192,8 @@ static void session_task(void *arg)
                 xEventGroupClearBits(s_evt, WS_EVT_CONNECTED);
                 ESP_LOGI(TAG, "WS connected, start streaming");
                 char start_json[160];
-                int n = snprintf(start_json, sizeof(start_json),
-                    "{\"type\":\"start\",\"device\":\"%s\",\"wake\":\"hi,lexin\"}",
+                snprintf(start_json, sizeof(start_json),
+                    "{\"type\":\"start\",\"device\":\"%s\",\"wake\":\"nihaoxiaoyi\"}",
                     s_device);
                 ws_cfg_send_text(start_json);
                 tx_n = 0;
@@ -362,20 +378,53 @@ esp_err_t ws_cfg_init(void)
                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     }
 
-    /* WakeNet 初始化（失败回退"仅播放"模式，不阻塞主流程） */
-    s_wn = esp_wn_handle_from_name(WAKE_MODEL_NAME);
-    if (s_wn == NULL) {
-        ESP_LOGE(TAG, "WakeNet %s not found", WAKE_MODEL_NAME);
+    /* 从 model 分区加载 WakeNet（你好小易） */
+    srmodel_list_t *models = esp_srmodel_init("model");
+    if (models == NULL || models->num == 0) {
+        ESP_LOGE(TAG, "esp_srmodel_init(model) failed, check model partition flash");
     } else {
-        s_wn_data = s_wn->create(WAKE_MODEL_NAME, DET_MODE_90);
-        if (s_wn_data == NULL) {
-            ESP_LOGE(TAG, "WakeNet create failed (OOM?), fallback to play-only");
-            s_wn = NULL;
-        } else {
-            s_wn_chunk = s_wn->get_samp_chunksize(s_wn_data);
-            ESP_LOGI(TAG, "WakeNet %s ready, chunk=%d samples, rate=%d",
-                     WAKE_MODEL_NAME, s_wn_chunk, s_wn->get_samp_rate(s_wn_data));
+        ESP_LOGI(TAG, "SR models in /srmodel: %d", models->num);
+        for (int i = 0; i < models->num; i++) {
+            ESP_LOGI(TAG, "  [%d] %s", i, models->model_name[i] ? models->model_name[i] : "?");
         }
+        char *wn_name = esp_srmodel_filter(models, ESP_WN_PREFIX, "nihaoxiaoyi");
+        if (wn_name == NULL) {
+            wn_name = esp_srmodel_filter(models, ESP_WN_PREFIX, NULL);
+        }
+        if (wn_name) {
+            snprintf(s_wn_name, sizeof(s_wn_name), "%s", wn_name);
+        }
+    }
+
+    if (s_wn_name[0]) {
+        s_wn = esp_wn_handle_from_name(s_wn_name);
+        if (s_wn == NULL) {
+            ESP_LOGE(TAG, "WakeNet %s not found", s_wn_name);
+        } else {
+            ESP_LOGI(TAG, "heap before WN create: intern=%u spiram=%u",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+            s_wn_data = s_wn->create(s_wn_name, DET_MODE_90);
+            if (s_wn_data == NULL) {
+                ESP_LOGE(TAG, "WakeNet create failed (OOM?), fallback to play-only");
+                s_wn = NULL;
+            } else {
+                s_wn_chunk = s_wn->get_samp_chunksize(s_wn_data);
+                if (s_wn_chunk > SR_CHUNK_MAX) {
+                    ESP_LOGE(TAG, "WN chunk %d too large for buffer", s_wn_chunk);
+                    s_wn->destroy(s_wn_data);
+                    s_wn_data = NULL;
+                    s_wn = NULL;
+                } else {
+                    const char *ww = esp_wn_wakeword_from_name(s_wn_name);
+                    ESP_LOGI(TAG, "WakeNet %s ready, chunk=%d samples, rate=%d, word=%s",
+                             s_wn_name, s_wn_chunk, s_wn->get_samp_rate(s_wn_data),
+                             ww ? ww : "?");
+                }
+            }
+        }
+    } else {
+        ESP_LOGE(TAG, "No WakeNet packed in model partition");
     }
 
     xTaskCreatePinnedToCore(session_task, "session_task", 8192, NULL, 5, NULL, 1);

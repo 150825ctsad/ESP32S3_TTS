@@ -27,7 +27,7 @@
 #include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_log.h"
-#include "driver/i2c.h"
+#include "driver/i2c_master.h"
 #include "esp_rom_sys.h"
 #include "esp_check.h"
 #include "esp_vfs_fat.h"
@@ -39,7 +39,8 @@
 #define GPIO_MUTE_NUM   GPIO_NUM_1
 #define GPIO_MUTE_LEVEL 1
 #define ACK_CHECK_EN   0x1     /*!< I2C master will check ack from slave*/
-#define ADC_I2S_CHANNEL 4
+#define ADC_I2S_CHANNEL 1      /* ES8311 下混为单声道后交给上层 */
+#define ES8311_I2S_CH   2      /* ES8311 I2S 仍是立体声（左=MIC） */
 static sdmmc_card_t *card;
 static const char *TAG = "board";
 static int s_play_sample_rate = 16000;
@@ -50,6 +51,7 @@ static int s_bits_per_chan = 16;
 static i2s_chan_handle_t                tx_handle = NULL;        // I2S tx channel handler
 static i2s_chan_handle_t                rx_handle = NULL;        // I2S rx channel handler
 #endif
+static i2c_master_bus_handle_t          s_i2c_bus = NULL;
 static audio_codec_data_if_t *record_data_if = NULL;
 static audio_codec_ctrl_if_t *record_ctrl_if = NULL;
 static audio_codec_if_t *record_codec_if = NULL;
@@ -64,64 +66,31 @@ static esp_codec_dev_handle_t play_dev = NULL;
 
 esp_err_t bsp_i2c_init(i2c_port_t i2c_num, uint32_t clk_speed)
 {
-    i2c_config_t i2c_cfg = {
-        .mode = I2C_MODE_MASTER,
-        .scl_io_num = GPIO_I2C_SCL,
-        .sda_io_num = GPIO_I2C_SDA,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = clk_speed,
-    };
-    esp_err_t ret = i2c_param_config(i2c_num, &i2c_cfg);
-    if (ret != ESP_OK) {
-        return ESP_FAIL;
+    if (s_i2c_bus) {
+        return ESP_OK;
     }
-    return i2c_driver_install(i2c_num, i2c_cfg.mode, 0, 0, 0);
+    i2c_master_bus_config_t bus_cfg = {
+        .i2c_port = i2c_num,
+        .sda_io_num = GPIO_I2C_SDA,
+        .scl_io_num = GPIO_I2C_SCL,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    (void)clk_speed;
+    return i2c_new_master_bus(&bus_cfg, &s_i2c_bus);
 }
 
 esp_err_t bsp_codec_adc_init(int sample_rate)
 {
-    esp_err_t ret_val = ESP_OK;
-
-    // Do initialize of related interface: data_if, ctrl_if and gpio_if
-    audio_codec_i2s_cfg_t i2s_cfg = {
-        .port = I2S_NUM_1,
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
-        .rx_handle = rx_handle,
-        .tx_handle = NULL,
-#endif
-    };
-    record_data_if = audio_codec_new_i2s_data(&i2s_cfg);
-
-    audio_codec_i2c_cfg_t i2c_cfg = {.addr = ES7210_CODEC_DEFAULT_ADDR};
-    record_ctrl_if = audio_codec_new_i2c_ctrl(&i2c_cfg);
-    // New input codec interface
-    es7210_codec_cfg_t es7210_cfg = {
-        .ctrl_if = record_ctrl_if,
-        .mic_selected = ES7120_SEL_MIC1 | ES7120_SEL_MIC2 | ES7120_SEL_MIC3 | ES7120_SEL_MIC4,
-    };
-    record_codec_if = es7210_codec_new(&es7210_cfg);
-    // New input codec device
-    esp_codec_dev_cfg_t dev_cfg = {
-        .codec_if = record_codec_if,
-        .data_if = record_data_if,
-        .dev_type = ESP_CODEC_DEV_TYPE_IN,
-    };
-    record_dev = esp_codec_dev_new(&dev_cfg);
-
-    esp_codec_dev_sample_info_t fs = {
-        .sample_rate = 16000,
-        .channel = 2,
-        .bits_per_sample = 32,
-    };
-    esp_codec_dev_open(record_dev, &fs);
-    // esp_codec_dev_set_in_gain(record_dev, RECORD_VOLUME);
-    esp_codec_dev_set_in_channel_gain(record_dev, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0), RECORD_VOLUME);
-    esp_codec_dev_set_in_channel_gain(record_dev, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1), RECORD_VOLUME);
-    esp_codec_dev_set_in_channel_gain(record_dev, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(2), RECORD_VOLUME);
-    esp_codec_dev_set_in_channel_gain(record_dev, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(3), RECORD_VOLUME);
-
-    return ret_val;
+    (void)sample_rate;
+    if (play_dev == NULL) {
+        ESP_LOGE(TAG, "ES8311 not ready, cannot share for ADC");
+        return ESP_FAIL;
+    }
+    record_dev = play_dev;
+    ESP_LOGI(TAG, "ADC uses ES8311");
+    return ESP_OK;
 }
 
 esp_err_t bsp_codec_dac_init(int sample_rate, int channel_format, int bits_per_chan)
@@ -132,29 +101,33 @@ esp_err_t bsp_codec_dac_init(int sample_rate, int channel_format, int bits_per_c
     audio_codec_i2s_cfg_t i2s_cfg = {
         .port = I2S_NUM_1,
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
-        .rx_handle = NULL,
+        .rx_handle = rx_handle,
         .tx_handle = tx_handle,
 #endif
     };
     play_data_if = audio_codec_new_i2s_data(&i2s_cfg);
 
-    audio_codec_i2c_cfg_t i2c_cfg = {.addr = ES8311_CODEC_DEFAULT_ADDR};
+    audio_codec_i2c_cfg_t i2c_cfg = {
+        .port = I2C_NUM,
+        .addr = ES8311_CODEC_DEFAULT_ADDR,
+        .bus_handle = s_i2c_bus,
+        .clock_speed_hz = I2C_CLK,
+    };
     play_ctrl_if = audio_codec_new_i2c_ctrl(&i2c_cfg);
     play_gpio_if = audio_codec_new_gpio();
-    // New output codec interface
     es8311_codec_cfg_t es8311_cfg = {
-        .codec_mode = ESP_CODEC_DEV_WORK_MODE_DAC,
+        .codec_mode = ESP_CODEC_DEV_WORK_MODE_BOTH,
         .ctrl_if = play_ctrl_if,
         .gpio_if = play_gpio_if,
         .pa_pin = GPIO_PWR_CTRL,
         .use_mclk = false,
+        .no_dac_ref = true,
     };
     play_codec_if = es8311_codec_new(&es8311_cfg);
-    // New output codec device
     esp_codec_dev_cfg_t dev_cfg = {
         .codec_if = play_codec_if,
         .data_if = play_data_if,
-        .dev_type = ESP_CODEC_DEV_TYPE_OUT,
+        .dev_type = ESP_CODEC_DEV_TYPE_IN_OUT,
     };
     play_dev = esp_codec_dev_new(&dev_cfg);
 
@@ -163,41 +136,23 @@ esp_err_t bsp_codec_dac_init(int sample_rate, int channel_format, int bits_per_c
         .sample_rate = sample_rate,
         .channel = channel_format,
     };
+    esp_codec_dev_set_in_gain(play_dev, RECORD_VOLUME);
     esp_codec_dev_set_out_vol(play_dev, PLAYER_VOLUME);
-    esp_codec_dev_open(play_dev, &fs);
+    ret_val = esp_codec_dev_open(play_dev, &fs);
+    if (ret_val != ESP_OK) {
+        ESP_LOGE(TAG, "ES8311 open fail: %s", esp_err_to_name(ret_val));
+    } else {
+        ESP_LOGI(TAG, "ES8311 open ok (DAC+ADC)");
+    }
 
     return ret_val;
 }
 
 static esp_err_t bsp_codec_adc_deinit()
 {
-    esp_err_t ret_val = ESP_OK;
-
-    if (record_dev) {
-        esp_codec_dev_close(record_dev);
-        esp_codec_dev_delete(record_dev);
-        record_dev = NULL;
-    }
-
-    // Delete codec interface
-    if (record_codec_if) {
-        audio_codec_delete_codec_if(record_codec_if);
-        record_codec_if = NULL;
-    }
-    
-    // Delete codec control interface
-    if (record_ctrl_if) {
-        audio_codec_delete_ctrl_if(record_ctrl_if);
-        record_ctrl_if = NULL;
-    }
-    
-    // Delete codec data interface
-    if (record_data_if) {
-        audio_codec_delete_data_if(record_data_if);
-        record_data_if = NULL;
-    }
-
-    return ret_val;
+    /* record_dev 与 play_dev 共用 ES8311，由 dac_deinit 释放 */
+    record_dev = NULL;
+    return ESP_OK;
 }
 
 static esp_err_t bsp_codec_dac_deinit()
@@ -344,10 +299,9 @@ static esp_err_t bsp_i2s_deinit(i2s_port_t i2s_num)
 static esp_err_t bsp_codec_init(int adc_sample_rate, int dac_sample_rate, int dac_channel_format, int dac_bits_per_chan)
 {
     esp_err_t ret_val = ESP_OK;
-
-    ret_val |= bsp_codec_adc_init(adc_sample_rate);
+    /* 先开 ES8311 全双工，再让 ADC 复用同一设备（不再访问 ES7210） */
     ret_val |= bsp_codec_dac_init(dac_sample_rate, dac_channel_format, dac_bits_per_chan);
-
+    ret_val |= bsp_codec_adc_init(adc_sample_rate);
     return ret_val;
 }
 
@@ -420,21 +374,31 @@ esp_err_t bsp_audio_play(const int16_t* data, int length, TickType_t ticks_to_wa
 
 esp_err_t bsp_get_feed_data(bool is_get_raw_channel, int16_t *buffer, int buffer_len)
 {
-    esp_err_t ret = ESP_OK;
-    size_t bytes_read;
-    int audio_chunksize = buffer_len / (sizeof(int16_t) * ADC_I2S_CHANNEL);
-
-    ret = esp_codec_dev_read(record_dev, (void *)buffer, buffer_len);
-    if (!is_get_raw_channel) {
-        for (int i = 0; i < audio_chunksize; i++) {
-            int16_t ref = buffer[4 * i + 0];
-            buffer[3 * i + 0] = buffer[4 * i + 1];
-            buffer[3 * i + 1] = buffer[4 * i + 3];
-            buffer[3 * i + 2] = ref;
-        }
+    if (!record_dev) {
+        return ESP_FAIL;
+    }
+    if (is_get_raw_channel) {
+        return esp_codec_dev_read(record_dev, (void *)buffer, buffer_len);
     }
 
-    return ret;
+    /* 从 ES8311 立体声取出左声道（MIC）写成 mono */
+    int mono_samples = buffer_len / (int)sizeof(int16_t);
+    if (mono_samples <= 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    static int16_t stereo[512 * ES8311_I2S_CH];
+    if (mono_samples > 512) {
+        mono_samples = 512;
+    }
+    int stereo_bytes = mono_samples * ES8311_I2S_CH * (int)sizeof(int16_t);
+    esp_err_t ret = esp_codec_dev_read(record_dev, stereo, stereo_bytes);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    for (int i = 0; i < mono_samples; i++) {
+        buffer[i] = stereo[i * ES8311_I2S_CH];
+    }
+    return ESP_OK;
 }
 
 int bsp_get_feed_channel(void)
@@ -444,7 +408,7 @@ int bsp_get_feed_channel(void)
 
 char* bsp_get_input_format(void)
 {
-    return "RMNM";
+    return "M";
 }
 
 esp_err_t bsp_board_init(uint32_t sample_rate, int channel_format, int bits_per_chan)
