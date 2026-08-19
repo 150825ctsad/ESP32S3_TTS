@@ -14,7 +14,7 @@ dependencies:
   #   # `public` flag doesn't have an effect dependencies of the `main` component.
   #   # All dependencies of `main` are public by default.
   #   public: true
-  espressif/esp-sr: ^2.4.7
+  espressif/esp-sr: ^2.5.0
   espressif/esp-dsp: ^1.8.0
   espressif/esp_codec_dev: ^1.6.2
   espressif/cjson: ^1.7.19~2

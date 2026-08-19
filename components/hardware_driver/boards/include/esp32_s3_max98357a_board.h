@@ -83,7 +83,6 @@
 /**
  * @brief Default playback volume (0-100)
  */
-#define PLAYER_VOLUME   (50)
 #define PLAYER_VOLUME   (75)
 
 /**
