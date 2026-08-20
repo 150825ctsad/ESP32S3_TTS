@@ -30,7 +30,6 @@
 #define TAG                    "MQTT_CLIENT"
 #define MQTT_BROKER_URI        "mqtt://mqtt-xiaoyi.gejia.tech" //mqtt:mqtt-xiaoyi.gejia.tech wss:https://iot-xiaoyi.gejia.tech
 #define MQTT_BROKER_PORT       1883
-#define WS_HOST_BASE           "https://iot-xiaoyi.gejia.tech"
 
 #define MQTT_USERNAME          "esp32s3"
 #define MQTT_PASSWORD          ""
@@ -176,7 +175,7 @@ static void handle_command(const char *msg_str)
         if (cJSON_IsString(iter) && iter->valuestring != NULL) {
             if (strncmp(iter->valuestring, "/ws/", 4) == 0) {
                 char full_ws[256];
-                int n = snprintf(full_ws, sizeof(full_ws), "https://iot-xiaoyi.gejia.tech%s", iter->valuestring);
+                int n = snprintf(full_ws, sizeof(full_ws), "https://iot.gejia.tech%s", iter->valuestring);
                 if (n > 0 && n < (int)sizeof(full_ws)) {
                     ESP_LOGI(TAG, "Detected ws path in cmd (field=%s): %s", iter->string ? iter->string : "<anon>", full_ws);
                     if (ws_cfg_set_uri(full_ws) == ESP_OK) {

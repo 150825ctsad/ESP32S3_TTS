@@ -705,7 +705,7 @@ static void ev_handler(void *arg, esp_event_base_t base,
         /* 配网试连阶段不启动 MQTT；退出配网拿到正式 IP 后再建任务 */
         if (!s_mqtt_started && !s_provisioning) {
             s_mqtt_started = true;
-            xTaskCreatePinnedToCore(mqtt_task, "mqtt_task", 6144, NULL, 5, NULL, 1);
+            xTaskCreatePinnedToCore(mqtt_task, "mqtt_task", 8192, NULL, 5, NULL, 1);
         }
     }
 }

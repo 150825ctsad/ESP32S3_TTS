@@ -419,32 +419,32 @@ static void session_task(void *arg)
         if (nsamp > (int)(sizeof(mono) / sizeof(mono[0]))) nsamp = (int)(sizeof(mono) / sizeof(mono[0]));
         for (int i = 0; i < nsamp; i++) mono[i] = frame[ch * i];
 
-        /* 每秒打一次麦能量：安静几十~几百，对着麦说话应明显升高 */
-        {
-            static uint32_t abs_acc, peak, frames;
-            static TickType_t t_log;
-            uint32_t frame_peak = 0;
-            uint32_t abs_sum = 0;
-            for (int i = 0; i < nsamp; i++) {
-                int v = mono[i];
-                uint32_t a = (uint32_t)(v < 0 ? -v : v);
-                abs_sum += a;
-                if (a > frame_peak) frame_peak = a;
-            }
-            abs_acc += abs_sum / (uint32_t)nsamp;
-            if (frame_peak > peak) peak = frame_peak;
-            frames++;
-            TickType_t now = xTaskGetTickCount();
-            if (t_log == 0 || (now - t_log) >= pdMS_TO_TICKS(1000)) {
-                ESP_LOGI(TAG, "mic |avg|=%u peak=%u frames=%u",
-                         (unsigned)(frames ? abs_acc / frames : 0),
-                         (unsigned)peak, (unsigned)frames);
-                abs_acc = 0;
-                peak = 0;
-                frames = 0;
-                t_log = now;
-            }
-        }
+        // /* 每秒打一次麦能量：安静几十~几百，对着麦说话应明显升高 */
+        // {
+        //     static uint32_t abs_acc, peak, frames;
+        //     static TickType_t t_log;
+        //     uint32_t frame_peak = 0;
+        //     uint32_t abs_sum = 0;
+        //     for (int i = 0; i < nsamp; i++) {
+        //         int v = mono[i];
+        //         uint32_t a = (uint32_t)(v < 0 ? -v : v);
+        //         abs_sum += a;
+        //         if (a > frame_peak) frame_peak = a;
+        //     }
+        //     abs_acc += abs_sum / (uint32_t)nsamp;
+        //     if (frame_peak > peak) peak = frame_peak;
+        //     frames++;
+        //     TickType_t now = xTaskGetTickCount();
+        //     if (t_log == 0 || (now - t_log) >= pdMS_TO_TICKS(1000)) {
+        //         ESP_LOGI(TAG, "mic |avg|=%u peak=%u frames=%u",
+        //                  (unsigned)(frames ? abs_acc / frames : 0),
+        //                  (unsigned)peak, (unsigned)frames);
+        //         abs_acc = 0;
+        //         peak = 0;
+        //         frames = 0;
+        //         t_log = now;
+        //     }
+        // }
 
         if (use_afe_wake || use_afe_vc) {
             afe_feed_mono(mono, nsamp);
