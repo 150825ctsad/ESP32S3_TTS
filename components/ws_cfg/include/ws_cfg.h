@@ -26,7 +26,8 @@ bool ws_cfg_has_uri(void);
  * @brief 云端下发 ws 后立刻发起一次 TTS 播放会话（不走麦克风上行）
  *
  * 播完后通过 ws_cfg_set_push_done_cb 回调 msgId。
- * 若当前正在语音会话中，会等到回到 IDLE 再连接。
+ * msgId 无效（空、"string" 等）或云端 PCM 不完整时，改用本地 TTS 播 tts 文本。
+ * 若当前正在语音会话中，会等到回到 IDLE 再处理。
  */
 esp_err_t ws_cfg_request_push(const char *msg_id, const char *tts_text);
 

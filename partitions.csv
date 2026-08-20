@@ -1,5 +1,6 @@
-# Name,  Type, SubType, Offset,  Size
-factory, app,  factory, 0x010000, 4M
-nvs,     data,  nvs,     0x410000, 24K
+# Name,   Type, SubType, Offset,  Size
+factory,  app,  factory, 0x010000, 4M
+nvs,      data, nvs,     0x410000, 24K
 voice_data, data, fat,   0x416000, 3M
-model,   data,  spiffs,  0x716000, 1M
+model,    data, spiffs,  0x716000, 1M
+tts_data, data, fat,     0x816000, 3M

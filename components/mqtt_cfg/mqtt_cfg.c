@@ -185,7 +185,7 @@ static void handle_command(const char *msg_str)
             }
         }
     }
-    if (got_ws) {
+    if (got_ws || (tts_text && tts_text[0])) {
         ws_cfg_request_push(msgid, tts_text);
     }
 

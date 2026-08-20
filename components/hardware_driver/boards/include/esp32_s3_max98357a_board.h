@@ -58,11 +58,6 @@
 #define GPIO_I2S_SCLK       (GPIO_NUM_41)   /* BCLK / bit clock（共用） */
 #define GPIO_I2S_SDIN       (GPIO_NUM_39)   /* MSM261 SD 数据输出 */
 #define GPIO_I2S_DOUT       (GPIO_NUM_42)   /* MAX98357A DIN */
-#define GPIO_I2S_LRCK       (GPIO_NUM_15)   /* WS / word select */
-#define GPIO_I2S_MCLK       (GPIO_NUM_NC)   /* MAX98357A has internal PLL, no MCLK needed */
-#define GPIO_I2S_SCLK       (GPIO_NUM_7)    /* BCLK / bit clock */
-#define GPIO_I2S_SDIN       (GPIO_NUM_NC)   /* no microphone input */
-#define GPIO_I2S_DOUT       (GPIO_NUM_6)    /* DIN on MAX98357A */
 
 /**
  * @brief Secondary I2S - not used

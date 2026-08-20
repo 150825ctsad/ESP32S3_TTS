@@ -28,6 +28,7 @@
 #include "esp_heap_caps.h"
 #include "cJSON.h"
 #include "ringbuf.h"
+#include "TTS.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -45,8 +46,9 @@
 #define AFE_FEED_MAX         2048
 
 #define RING_BLOCK_SIZE      1024
-#define RING_N_BLOCKS        32
+#define RING_N_BLOCKS        80      /* ~80KB，容纳云端约 50–80KB PCM */
 #define UP_RING_BLOCKS       16
+#define PLAY_DRAIN_MAX_MS    8000
 
 #define VAD_RMS_THRESHOLD    300
 #define VAD_HANGOVER         32
@@ -65,7 +67,8 @@ typedef enum {
 } sess_state_t;
 
 typedef enum {
-    AFE_PIPE_WAKE = 0,
+    AFE_PIPE_OFF = 0,  /* 播放期间停 feed/fetch，避免空环告警 */
+    AFE_PIPE_WAKE,
     AFE_PIPE_VC,
 } afe_pipe_t;
 
@@ -274,13 +277,50 @@ static void afe_fetch_task(void *arg)
 /*  会话收尾                                                         */
 /* ================================================================ */
 
+static void play_local_tts_fallback(const char *text, bool *ok)
+{
+    if (text == NULL || text[0] == '\0') {
+        return;
+    }
+    if (!tts_ready()) {
+        ESP_LOGW(TAG, "Local TTS unavailable, skip fallback");
+        return;
+    }
+    ESP_LOGI(TAG, "Fallback local TTS: %s", text);
+    afe_set_pipe(AFE_PIPE_OFF);
+    if (tts_play(text) == ESP_OK) {
+        *ok = true;
+    }
+    afe_set_pipe(AFE_PIPE_WAKE);
+}
+
+static bool msgid_is_valid(const char *id)
+{
+    if (id == NULL || id[0] == '\0') {
+        return false;
+    }
+    if (strcmp(id, "string") == 0 || strcmp(id, "null") == 0 ||
+        strcmp(id, "undefined") == 0) {
+        return false;
+    }
+    for (const char *p = id; *p; p++) {
+        if (*p != ' ' && *p != '\t') {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void session_teardown(bool normal)
 {
     char msgid[sizeof(s_push_msgid)];
+    char tts[sizeof(s_push_tts)];
     bool was_push = s_push_active;
     msgid[0] = '\0';
+    tts[0] = '\0';
     if (was_push) {
         snprintf(msgid, sizeof(msgid), "%s", s_push_msgid);
+        snprintf(tts, sizeof(tts), "%s", s_push_tts);
         s_push_active = false;
         s_push_msgid[0] = '\0';
         s_push_tts[0] = '\0';
@@ -289,6 +329,12 @@ static void session_teardown(bool normal)
     if (normal) {
         rb_done_write(s_ring);
         ESP_LOGI(TAG, "Draining playback");
+        TickType_t t0 = xTaskGetTickCount();
+        while (s_ring && rb_bytes_filled(s_ring) > 0 &&
+               (xTaskGetTickCount() - t0) < pdMS_TO_TICKS(PLAY_DRAIN_MAX_MS)) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        vTaskDelay(pdMS_TO_TICKS(80));
     } else {
         rb_unblock_reader(s_ring);
         ESP_LOGW(TAG, "Abort playback");
@@ -301,8 +347,12 @@ static void session_teardown(bool normal)
     s_state = SESS_IDLE;
     ESP_LOGI(TAG, "Session teardown -> IDLE");
 
+    bool ok = normal;
+    if (was_push && !normal) {
+        play_local_tts_fallback(tts, &ok);
+    }
     if (was_push && msgid[0] && s_push_done_cb) {
-        s_push_done_cb(msgid, normal);
+        s_push_done_cb(msgid, ok);
     }
 }
 
@@ -339,8 +389,8 @@ esp_err_t ws_cfg_request_push(const char *msg_id, const char *tts_text)
         ESP_LOGE(TAG, "Voice session not ready");
         return ESP_ERR_INVALID_STATE;
     }
-    if (!ws_cfg_has_uri()) {
-        ESP_LOGE(TAG, "No ws uri for push");
+    if (!ws_cfg_has_uri() && (tts_text == NULL || tts_text[0] == '\0')) {
+        ESP_LOGE(TAG, "No ws uri and no tts text for push");
         return ESP_ERR_INVALID_STATE;
     }
     snprintf(s_push_msgid, sizeof(s_push_msgid), "%s", msg_id ? msg_id : "");
@@ -455,11 +505,16 @@ static void session_task(void *arg)
         case SESS_IDLE:
             if (xEventGroupGetBits(s_evt) & SESS_EVT_PUSH) {
                 xEventGroupClearBits(s_evt, SESS_EVT_PUSH);
-                if (!ws_cfg_has_uri()) {
-                    ESP_LOGW(TAG, "Push without uri");
+                bool use_cloud = msgid_is_valid(s_push_msgid) && ws_cfg_has_uri();
+                if (!use_cloud) {
+                    ESP_LOGW(TAG, "msgId invalid or no WS, local TTS (msgId=%s)",
+                             s_push_msgid[0] ? s_push_msgid : "-");
+                    bool ok = false;
+                    play_local_tts_fallback(s_push_tts, &ok);
                     if (s_push_msgid[0] && s_push_done_cb) {
-                        s_push_done_cb(s_push_msgid, false);
+                        s_push_done_cb(s_push_msgid, ok);
                     }
+                    s_push_active = false;
                     s_push_msgid[0] = '\0';
                     s_push_tts[0] = '\0';
                     break;
@@ -605,7 +660,7 @@ stream_end:
             } else if (bits & WS_EVT_TTS_DONE) {
                 xEventGroupClearBits(s_evt, WS_EVT_TTS_DONE);
                 ESP_LOGI(TAG, "done without audio");
-                session_teardown(true);
+                session_teardown(false);
             } else if (bits & WS_EVT_TTS_ERROR) {
                 xEventGroupClearBits(s_evt, WS_EVT_TTS_ERROR);
                 session_teardown(false);
@@ -624,8 +679,13 @@ stream_end:
             EventBits_t bits = xEventGroupGetBits(s_evt);
             if (bits & WS_EVT_TTS_DONE) {
                 xEventGroupClearBits(s_evt, WS_EVT_TTS_DONE);
-                ESP_LOGI(TAG, "TTS done, draining");
-                session_teardown(true);
+                if (!ws_cfg_pcm_complete()) {
+                    ESP_LOGW(TAG, "PCM incomplete, local TTS fallback");
+                    session_teardown(false);
+                } else {
+                    ESP_LOGI(TAG, "TTS done, draining");
+                    session_teardown(true);
+                }
             } else if (bits & WS_EVT_TTS_ERROR) {
                 xEventGroupClearBits(s_evt, WS_EVT_TTS_ERROR);
                 session_teardown(false);
@@ -648,11 +708,15 @@ stream_end:
 
 esp_err_t ws_cfg_play_tone(void)
 {
+    afe_pipe_t prev = s_pipe;
+    afe_set_pipe(AFE_PIPE_OFF);
+    esp_err_t ret = ESP_FAIL;
+
     const esp_partition_t *part = esp_partition_find_first(
         ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "voice_data");
     if (part == NULL) {
         ESP_LOGE(TAG, "voice_data partition not found");
-        return ESP_FAIL;
+        goto out;
     }
 
     esp_partition_mmap_handle_t map_handle;
@@ -660,7 +724,7 @@ esp_err_t ws_cfg_play_tone(void)
     if (esp_partition_mmap(part, 0, part->size, ESP_PARTITION_MMAP_DATA,
                            &map, &map_handle) != ESP_OK) {
         ESP_LOGE(TAG, "mmap failed");
-        return ESP_FAIL;
+        goto out;
     }
 
     const uint8_t *wav = (const uint8_t *)map;
@@ -683,7 +747,7 @@ esp_err_t ws_cfg_play_tone(void)
     if (data_len == 0 || data_off + data_len > part->size) {
         ESP_LOGE(TAG, "Invalid WAV in partition");
         esp_partition_munmap(map_handle);
-        return ESP_FAIL;
+        goto out;
     }
 
     uint32_t pos = 0;
@@ -697,7 +761,11 @@ esp_err_t ws_cfg_play_tone(void)
     }
     esp_partition_munmap(map_handle);
     ESP_LOGI(TAG, "Tone played (%u bytes)", data_len);
-    return ESP_OK;
+    ret = ESP_OK;
+
+out:
+    afe_set_pipe(prev);
+    return ret;
 }
 
 /* ================================================================ */
@@ -765,10 +833,14 @@ esp_err_t ws_cfg_init(void)
 
     afe_set_pipe(AFE_PIPE_WAKE);
 
+    if (tts_init() != ESP_OK) {
+        ESP_LOGW(TAG, "Local TTS init failed, cloud-only playback");
+    }
+
     xTaskCreatePinnedToCore(session_task, "session_task", 8192, NULL, 5, NULL, 0);
     xTaskCreatePinnedToCore(afe_fetch_task, "afe_fetch", 4096, NULL, 4, NULL, 1);
     xTaskCreatePinnedToCore(player_task, "player_task", 4096, NULL, 4, NULL, 1);
-    ESP_LOGI(TAG, "Voice session initialized (device=%s afe_wake=%d afe_vc=%d)",
-             s_device, s_afe_wake != NULL, s_afe_vc != NULL);
+    ESP_LOGI(TAG, "Voice session initialized (device=%s afe_wake=%d afe_vc=%d tts=%d)",
+             s_device, s_afe_wake != NULL, s_afe_vc != NULL, tts_ready());
     return ESP_OK;
 }

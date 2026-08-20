@@ -18,6 +18,8 @@
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #define ADC_I2S_CHANNEL 0
 
@@ -95,6 +97,7 @@ static esp_codec_dev_handle_t play_dev = NULL;
 static audio_codec_data_if_t *rec_data_if = NULL;
 static audio_codec_if_t      *rec_codec_if = NULL;
 static esp_codec_dev_handle_t rec_dev = NULL;
+static SemaphoreHandle_t s_play_lock = NULL;
 
 /* ------------------------------------------------------------------ */
 /*  I2S init (TX + RX 全双工，共用 BCLK/WS)                            */
@@ -348,6 +351,10 @@ esp_err_t bsp_board_init(uint32_t sample_rate, int channel_format, int bits_per_
 
     ESP_LOGI(TAG, "Init I2S: rate=%lu ch=%d bits=%d", sample_rate, channel_format, bits_per_chan);
 
+    if (s_play_lock == NULL) {
+        s_play_lock = xSemaphoreCreateMutex();
+    }
+
     esp_err_t ret = bsp_i2s_init(I2S_NUM_0, sample_rate, channel_format, bits_per_chan);
     if (ret != ESP_OK) return ret;
 
@@ -371,24 +378,28 @@ esp_err_t bsp_audio_play(const int16_t *data, int length, TickType_t ticks_to_wa
         return ESP_FAIL;
     }
 
+    if (s_play_lock) xSemaphoreTake(s_play_lock, portMAX_DELAY);
+
     /* 禁止就地改写调用方缓冲：welcome.wav 在 flash mmap，写入会 Cache error 重启 */
     static int16_t scratch[512];
     const uint8_t *src = (const uint8_t *)data;
     int remaining = length;
+    esp_err_t ret = ESP_OK;
     while (remaining > 0) {
         int n = remaining > (int)sizeof(scratch) ? (int)sizeof(scratch) : remaining;
         memcpy(scratch, src, (size_t)n);
 #if AUDIO_PREPROCESS_EN
         audio_preprocess(scratch, n / (int)sizeof(int16_t));
 #endif
-        esp_err_t ret = esp_codec_dev_write(play_dev, scratch, n);
+        ret = esp_codec_dev_write(play_dev, scratch, n);
         if (ret != ESP_OK) {
-            return ret;
+            break;
         }
         src += n;
         remaining -= n;
     }
-    return ESP_OK;
+    if (s_play_lock) xSemaphoreGive(s_play_lock);
+    return ret;
 }
 
 esp_err_t bsp_audio_set_play_vol(int volume)
@@ -412,7 +423,10 @@ esp_err_t bsp_audio_flush(void)
     /* 不能加 const：esp_codec_dev 软件音量会就地改写该缓冲，
      * const 数组位于 flash 映射区，写入会触发 Cache error panic */
     static int16_t silence[FLUSH_SILENCE_SAMPLES];   /* .bss 零初始化 */
-    return esp_codec_dev_write(play_dev, (void *)silence, sizeof(silence));
+    if (s_play_lock) xSemaphoreTake(s_play_lock, portMAX_DELAY);
+    esp_err_t ret = esp_codec_dev_write(play_dev, (void *)silence, sizeof(silence));
+    if (s_play_lock) xSemaphoreGive(s_play_lock);
+    return ret;
 }
 
 /* -- Recording: MSM261S4030H0R I2S MEMS microphone -- */

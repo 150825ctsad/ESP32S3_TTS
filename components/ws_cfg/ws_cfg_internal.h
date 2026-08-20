@@ -13,7 +13,7 @@ extern "C" {
 /* 会话事件位（ws_cfg transport → voice_session） */
 #define WS_EVT_CONNECTED    (1 << 0)   /* WS 连接成功 */
 #define WS_EVT_DISCONNECTED (1 << 1)   /* WS 断开（非主动） */
-#define WS_EVT_TTS_DONE     (1 << 2)   /* 收到 {"type":"done"} */
+#define WS_EVT_TTS_DONE     (1 << 2)   /* 收到 {"type":"done"} 或 {"type":"end"} */
 #define WS_EVT_TTS_ERROR    (1 << 3)   /* 收到 {"type":"error"} */
 #define SESS_EVT_PUSH       (1 << 10)  /* MQTT 下发 ws，请求立刻连云端播 TTS */
 
@@ -38,6 +38,11 @@ esp_err_t ws_cfg_send_text(const char *json);
 
 /** @brief 发送 PCM16 二进制帧（仅 session_task 上下文调用） */
 esp_err_t ws_cfg_send_pcm(const uint8_t *data, int len);
+
+/**
+ * @brief 本次下行 PCM 是否收全（对照 header.bytes；无 header 则有数据即算完整）
+ */
+bool ws_cfg_pcm_complete(void);
 
 #ifdef __cplusplus
 }

@@ -10,12 +10,16 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include "ws_cfg.h"
 #include "ws_cfg_internal.h"
 #include "esp_websocket_client.h"
 #include "esp_log.h"
 #include "esp_crt_bundle.h"
 #include "cJSON.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #define TAG "WS_CFG"
 
@@ -24,12 +28,165 @@
 #define WS_NET_TIMEOUT_MS   10000
 #define WS_TASK_STACK       8192
 #define WS_SEND_TIMEOUT_MS  100
+#define PLAY_HZ             16000
+#define RS_OUT_MAX          4096
+#define RS_IN_MAX           8
+#define PCM_WRITE_WAIT_MS   1000
 
 static esp_websocket_client_handle_t s_client = NULL;
 static char s_uri[WS_URI_MAX] = {0};
 
 static EventGroupHandle_t s_evt = NULL;
 static ringbuf_handle_t s_ring = NULL;
+
+/* 云端 header.sampleRate → 板端 16 kHz 线性重采样状态 */
+static int s_src_hz = PLAY_HZ;
+static int16_t s_rs_in[RS_IN_MAX];
+static int s_rs_nin = 0;
+static int s_rs_frac = 0;
+static uint8_t s_odd_byte;
+static bool s_have_odd = false;
+static int16_t s_rs_out[RS_OUT_MAX];
+static uint8_t s_pcm_align[WS_BUFFER_SIZE + 2] __attribute__((aligned(4)));
+static int s_pcm_bytes_in;
+static int s_pcm_bytes_out;
+static int s_header_bytes;
+
+static void tts_rx_reset(int hz)
+{
+    s_src_hz = (hz > 0) ? hz : PLAY_HZ;
+    s_rs_nin = 0;
+    s_rs_frac = 0;
+    s_have_odd = false;
+    s_pcm_bytes_in = 0;
+    s_pcm_bytes_out = 0;
+    s_header_bytes = 0;
+}
+
+static bool virt_sample(int idx, const int16_t *fresh, int nfresh, int16_t *out)
+{
+    if (idx < s_rs_nin) {
+        *out = s_rs_in[idx];
+        return true;
+    }
+    int j = idx - s_rs_nin;
+    if (j >= 0 && j < nfresh) {
+        *out = fresh[j];
+        return true;
+    }
+    return false;
+}
+
+static int pcm_write_play(const uint8_t *data, int len)
+{
+    if (s_ring == NULL || data == NULL || len <= 0) {
+        return 0;
+    }
+
+    const uint8_t *p = data;
+    int n = len;
+    if (s_have_odd && n > 0) {
+        if (n + 1 > (int)sizeof(s_pcm_align)) {
+            ESP_LOGW(TAG, "PCM stitch overflow, drop odd byte");
+            s_have_odd = false;
+        } else {
+            s_pcm_align[0] = s_odd_byte;
+            memcpy(s_pcm_align + 1, data, (size_t)n);
+            p = s_pcm_align;
+            n += 1;
+            s_have_odd = false;
+        }
+    }
+    if (n & 1) {
+        s_odd_byte = p[n - 1];
+        s_have_odd = true;
+        n--;
+    }
+    if (n < 2) {
+        return 0;
+    }
+
+    int nfresh = n / 2;
+    bool need_rs = !(s_src_hz == PLAY_HZ && s_rs_nin == 0 && s_rs_frac == 0);
+    if (need_rs && p != s_pcm_align) {
+        if (n > (int)sizeof(s_pcm_align)) {
+            n = (int)sizeof(s_pcm_align) & ~1;
+            nfresh = n / 2;
+        }
+        memcpy(s_pcm_align, p, (size_t)n);
+        p = s_pcm_align;
+    }
+    const int16_t *fresh = (const int16_t *)p;
+    s_pcm_bytes_in += nfresh * 2;
+
+    if (!need_rs) {
+        int w = rb_write(s_ring, (char *)fresh, nfresh * 2, pdMS_TO_TICKS(PCM_WRITE_WAIT_MS));
+        if (w > 0) s_pcm_bytes_out += w;
+        if (w < nfresh * 2) {
+            ESP_LOGW(TAG, "Ring write short (%d/%d)", w, nfresh * 2);
+        }
+        return w;
+    }
+
+    int total = s_rs_nin + nfresh;
+    int idx = 0;
+    int nout = 0;
+    int written = 0;
+    int frac = s_rs_frac;
+
+    while (idx < total) {
+        int16_t a, b;
+        if (!virt_sample(idx, fresh, nfresh, &a)) break;
+        if (!virt_sample(idx + 1, fresh, nfresh, &b)) break;
+
+        if (nout >= RS_OUT_MAX) {
+            int w = rb_write(s_ring, (char *)s_rs_out, nout * 2, pdMS_TO_TICKS(PCM_WRITE_WAIT_MS));
+            if (w > 0) {
+                written += w;
+                s_pcm_bytes_out += w;
+            }
+            if (w < nout * 2) {
+                ESP_LOGW(TAG, "Ring write short (%d/%d)", w, nout * 2);
+            }
+            nout = 0;
+        }
+
+        s_rs_out[nout++] = (int16_t)(((int32_t)a * (PLAY_HZ - frac) + (int32_t)b * frac) / PLAY_HZ);
+        frac += s_src_hz;
+        idx += frac / PLAY_HZ;
+        frac %= PLAY_HZ;
+    }
+
+    if (nout > 0) {
+        int w = rb_write(s_ring, (char *)s_rs_out, nout * 2, pdMS_TO_TICKS(PCM_WRITE_WAIT_MS));
+        if (w > 0) {
+            written += w;
+            s_pcm_bytes_out += w;
+        }
+        if (w < nout * 2) {
+            ESP_LOGW(TAG, "Ring write short (%d/%d)", w, nout * 2);
+        }
+    }
+
+    int keep_from = idx;
+    if (keep_from > total) keep_from = total;
+    int nkeep = total - keep_from;
+    if (nkeep > RS_IN_MAX) {
+        ESP_LOGW(TAG, "Resample leftover overflow (%d), drop", nkeep);
+        nkeep = RS_IN_MAX;
+        keep_from = total - nkeep;
+    }
+    int16_t keep[RS_IN_MAX];
+    for (int i = 0; i < nkeep; i++) {
+        int16_t v = 0;
+        virt_sample(keep_from + i, fresh, nfresh, &v);
+        keep[i] = v;
+    }
+    memcpy(s_rs_in, keep, (size_t)nkeep * sizeof(int16_t));
+    s_rs_nin = nkeep;
+    s_rs_frac = frac;
+    return written;
+}
 
 /* ================================================================ */
 /*  事件回调                                                         */
@@ -73,11 +230,45 @@ static void ws_event_cb(void *arg, esp_event_base_t base,
             }
             cJSON *type = cJSON_GetObjectItemCaseSensitive(root, "type");
             if (cJSON_IsString(type) && type->valuestring) {
-                if (strcmp(type->valuestring, "done") == 0) {
-                    ESP_LOGI(TAG, "Received done");
+                if (strcmp(type->valuestring, "header") == 0) {
+                    cJSON *sr = cJSON_GetObjectItemCaseSensitive(root, "sampleRate");
+                    cJSON *ch = cJSON_GetObjectItemCaseSensitive(root, "channels");
+                    cJSON *bits = cJSON_GetObjectItemCaseSensitive(root, "bits");
+                    cJSON *nbytes = cJSON_GetObjectItemCaseSensitive(root, "bytes");
+                    int hz = PLAY_HZ;
+                    if (cJSON_IsNumber(sr) && sr->valuedouble > 0) {
+                        hz = (int)sr->valuedouble;
+                    }
+                    tts_rx_reset(hz);
+                    if (cJSON_IsNumber(nbytes) && nbytes->valuedouble > 0) {
+                        s_header_bytes = (int)nbytes->valuedouble;
+                    }
+                    ESP_LOGI(TAG, "TTS header: %d Hz ch=%d bits=%d bytes=%d -> play %d Hz",
+                             s_src_hz,
+                             cJSON_IsNumber(ch) ? (int)ch->valuedouble : 1,
+                             cJSON_IsNumber(bits) ? (int)bits->valuedouble : 16,
+                             cJSON_IsNumber(nbytes) ? (int)nbytes->valuedouble : 0,
+                             PLAY_HZ);
+                    if (cJSON_IsNumber(ch) && (int)ch->valuedouble != 1) {
+                        ESP_LOGW(TAG, "TTS header channels=%d, only mono is played",
+                                 (int)ch->valuedouble);
+                    }
+                } else if (strcmp(type->valuestring, "done") == 0 ||
+                           strcmp(type->valuestring, "end") == 0) {
+                    ESP_LOGI(TAG, "Received %s (pcm in=%d out=%d)",
+                             type->valuestring, s_pcm_bytes_in, s_pcm_bytes_out);
                     if (s_evt) xEventGroupSetBits(s_evt, WS_EVT_TTS_DONE);
                 } else if (strcmp(type->valuestring, "error") == 0) {
-                    ESP_LOGW(TAG, "Received error: %.*s", data->data_len, data->data_ptr);
+                    cJSON *err = cJSON_GetObjectItemCaseSensitive(root, "error");
+                    if (!cJSON_IsString(err) || !err->valuestring) {
+                        err = cJSON_GetObjectItemCaseSensitive(root, "message");
+                    }
+                    if (!cJSON_IsString(err) || !err->valuestring) {
+                        err = cJSON_GetObjectItemCaseSensitive(root, "msg");
+                    }
+                    ESP_LOGW(TAG, "Received error: %s",
+                             (cJSON_IsString(err) && err->valuestring)
+                                 ? err->valuestring : "(no detail)");
                     if (s_evt) xEventGroupSetBits(s_evt, WS_EVT_TTS_ERROR);
                 } else if (strcmp(type->valuestring, "tts_start") == 0) {
                     ESP_LOGI(TAG, "Received tts_start");
@@ -88,8 +279,8 @@ static void ws_event_cb(void *arg, esp_event_base_t base,
             cJSON_Delete(root);
         } else if (data->op_code == WS_TRANSPORT_OPCODES_BINARY ||
                    data->op_code == WS_TRANSPORT_OPCODES_CONT) {
-            /* 二进制帧 = PCM16 音频 → 播放缓冲（非阻塞，满则丢弃） */
-            int n = rb_write(s_ring, (char *)data->data_ptr, data->data_len, 0);
+            /* 二进制帧 = PCM → 重采样到 16 kHz 后写入播放缓冲 */
+            int n = pcm_write_play((const uint8_t *)data->data_ptr, data->data_len);
             if (n < 0) {
                 ESP_LOGW(TAG, "Ring write failed (%d), pcm dropped", n);
             }
@@ -160,6 +351,7 @@ esp_err_t ws_cfg_connect(void)
         .crt_bundle_attach = esp_crt_bundle_attach,  /* 公网 CA 根证书 bundle */
     };
 
+    tts_rx_reset(PLAY_HZ);
     s_client = esp_websocket_client_init(&cfg);
     if (s_client == NULL) {
         ESP_LOGE(TAG, "WS client init failed");
@@ -180,10 +372,11 @@ esp_err_t ws_cfg_connect(void)
 esp_err_t ws_cfg_disconnect(void)
 {
     if (s_client == NULL) return ESP_OK;
-    esp_websocket_client_close(s_client, 1000);
-    esp_websocket_client_stop(s_client);
+    /* destroy() 内部会 stop；对已关闭连接再 close+stop 会打
+     * "Client was not started" */
     esp_websocket_client_destroy(s_client);
     s_client = NULL;
+    tts_rx_reset(PLAY_HZ);
     ESP_LOGI(TAG, "WS closed");
     return ESP_OK;
 }
@@ -214,4 +407,17 @@ esp_err_t ws_cfg_send_pcm(const uint8_t *data, int len)
     int r = esp_websocket_client_send_bin(s_client, (const char *)data, len,
                                           pdMS_TO_TICKS(WS_SEND_TIMEOUT_MS));
     return r < 0 ? ESP_FAIL : ESP_OK;
+}
+
+bool ws_cfg_pcm_complete(void)
+{
+    if (s_pcm_bytes_in <= 0) {
+        return false;
+    }
+    if (s_header_bytes <= 0) {
+        return s_pcm_bytes_in >= 512;
+    }
+    int slack = s_header_bytes / 50;
+    if (slack < 64) slack = 64;
+    return (s_pcm_bytes_in + slack) >= s_header_bytes;
 }

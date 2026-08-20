@@ -103,6 +103,9 @@ esp_err_t bsp_board_init(uint32_t sample_rate, int channel_format, int bits_per_
 
 esp_err_t bsp_audio_play(const int16_t* data, int length, TickType_t ticks_to_wait);
 
+/** @brief 向功放写入静音，排空 I2S DMA 残留 */
+esp_err_t bsp_audio_flush(void);
+
 /**
  * @brief Get the record pcm data.
  * 
