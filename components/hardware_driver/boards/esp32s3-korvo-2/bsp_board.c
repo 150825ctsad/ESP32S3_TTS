@@ -388,15 +388,15 @@ esp_err_t bsp_get_feed_data(bool is_get_raw_channel, int16_t *buffer, int buffer
     if (peak_l > pk_l) pk_l = peak_l;
     if (peak_r > pk_r) pk_r = peak_r;
     frames++;
-    TickType_t now = xTaskGetTickCount();
-    if (t_log == 0 || (now - t_log) >= pdMS_TO_TICKS(1000)) {
-        ESP_LOGI(TAG, "adc L|avg|=%u peak=%u  R|avg|=%u peak=%u  frames=%u",
-                 (unsigned)(frames ? acc_l / frames : 0), (unsigned)pk_l,
-                 (unsigned)(frames ? acc_r / frames : 0), (unsigned)pk_r,
-                 (unsigned)frames);
-        acc_l = acc_r = pk_l = pk_r = frames = 0;
-        t_log = now;
-    }
+    // TickType_t now = xTaskGetTickCount();
+    // if (t_log == 0 || (now - t_log) >= pdMS_TO_TICKS(1000)) {
+    //     ESP_LOGI(TAG, "adc L|avg|=%u peak=%u  R|avg|=%u peak=%u  frames=%u",
+    //              (unsigned)(frames ? acc_l / frames : 0), (unsigned)pk_l,
+    //              (unsigned)(frames ? acc_r / frames : 0), (unsigned)pk_r,
+    //              (unsigned)frames);
+    //     acc_l = acc_r = pk_l = pk_r = frames = 0;
+    //     t_log = now;
+    // }
 
     (void)is_get_raw_channel;
     return ESP_OK;

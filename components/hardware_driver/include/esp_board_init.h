@@ -19,6 +19,7 @@
 
 #include <stdbool.h>
 #include "esp_err.h"
+#include "freertos/FreeRTOS.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -64,6 +65,11 @@ esp_err_t esp_sdcard_deinit(char *mount_point);
 esp_err_t get_i2s_data(char *buffer, int buffer_len);
 
 esp_err_t esp_audio_play(const int16_t* data, int length, TickType_t ticks_to_wait);
+
+/**
+ * @brief 向功放写入静音，排空 I2S DMA 残留（各板均可调用）
+ */
+esp_err_t esp_audio_flush(void);
 
 /**
  * @brief Get the record pcm data.

@@ -36,6 +36,7 @@
 #include "cJSON.h"
 #include "wifi_cfg.h"
 #include "mqtt_cfg.h"
+#include "ws_cfg.h"
 
 /* ================================================================ */
 /*  Embedded files (CMake EMBED_TXTFILES)                            */
@@ -44,6 +45,8 @@ extern const char softap_html_start[] asm("_binary_softap_html_start");
 extern const char softap_html_end[]   asm("_binary_softap_html_end");
 extern const char done_html_start[]   asm("_binary_done_html_start");
 extern const char done_html_end[]     asm("_binary_done_html_end");
+extern const uint8_t wificonfig_wav_start[] asm("_binary_wificonfig_wav_start");
+extern const uint8_t wificonfig_wav_end[]   asm("_binary_wificonfig_wav_end");
 
 /* ================================================================ */
 /*  Constants                                                        */
@@ -89,6 +92,7 @@ static TaskHandle_t      s_dns_task = NULL;
 static bool sta_try(const char *ssid, const char *pass, const uint8_t *bssid);
 static void build_ap_config(wifi_config_t *apc, char *ssid_out, size_t ssid_sz);
 static void start_provisioning(void);
+static void play_wificonfig_task(void *arg);
 static void dns_start(void);
 static void dns_stop(void);
 static void http_start(void);
@@ -761,6 +765,15 @@ static bool sta_try(const char *ssid, const char *pass, const uint8_t *bssid)
 /* ================================================================ */
 /*  SoftAP provisioning  (wifi already running in APSTA)             */
 /* ================================================================ */
+static void play_wificonfig_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "Playing Wi-Fi config prompt");
+    ws_cfg_play_wav(wificonfig_wav_start,
+                    (size_t)(wificonfig_wav_end - wificonfig_wav_start));
+    vTaskDelete(NULL);
+}
+
 static void start_provisioning(void)
 {
     if (s_provisioning && s_httpd) {
@@ -771,6 +784,7 @@ static void start_provisioning(void)
     ESP_LOGI(TAG, "Starting HTTP + DNS for provisioning (no reboot)");
     http_start();
     dns_start();
+    xTaskCreatePinnedToCore(play_wificonfig_task, "wifi_cfg_tone", 4096, NULL, 5, NULL, 1);
 }
 
 static void exit_config_task(void *arg)
@@ -864,4 +878,9 @@ void wifi_init(void)
 
     ESP_LOGW(TAG, "No saved credentials — entering provisioning (non-blocking)");
     start_provisioning();
+}
+
+bool wifi_is_provisioning(void)
+{
+    return s_provisioning;
 }

@@ -11,7 +11,7 @@
 #include "esp_tts_voice_template.h"
 #include "esp_partition.h"
 #include "esp_log.h"
-#include "bsp_board.h"
+#include "esp_board_init.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -70,14 +70,14 @@ static esp_err_t tts_speak(const char *text)
         if (pcm == NULL || len <= 0) break;
 
         if (tail_n > 0) {
-            bsp_audio_play(tail, tail_n * (int)sizeof(int16_t), portMAX_DELAY);
+            esp_audio_play(tail, tail_n * (int)sizeof(int16_t), portMAX_DELAY);
             total_bytes += tail_n * (int)sizeof(int16_t);
         }
 
         int16_t *tmp = realloc(tail, (size_t)len * sizeof(int16_t));
         if (tmp == NULL) {
             if (first) fade_in((int16_t *)pcm, len);
-            bsp_audio_play((int16_t *)pcm, len * (int)sizeof(int16_t), portMAX_DELAY);
+            esp_audio_play((int16_t *)pcm, len * (int)sizeof(int16_t), portMAX_DELAY);
             total_bytes += len * (int)sizeof(int16_t);
             tail_n = 0;
             first = false;
@@ -94,11 +94,11 @@ static esp_err_t tts_speak(const char *text)
 
     if (tail_n > 0) {
         fade_out(tail, tail_n);
-        bsp_audio_play(tail, tail_n * (int)sizeof(int16_t), portMAX_DELAY);
+        esp_audio_play(tail, tail_n * (int)sizeof(int16_t), portMAX_DELAY);
         total_bytes += tail_n * (int)sizeof(int16_t);
     }
     free(tail);
-    bsp_audio_flush();
+    esp_audio_flush();
     esp_tts_stream_reset(s_tts);
 
     ESP_LOGI(TAG, "played %d bytes (%d ms): %s",

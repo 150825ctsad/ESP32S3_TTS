@@ -22,6 +22,9 @@
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
 #include "esp_board_init.h"
+#include "string.h"
+#include "sdkconfig.h"
+#include "freertos/FreeRTOS.h"
 
 static const char *TAG = "hardware";
 
@@ -58,6 +61,18 @@ char* esp_get_input_format(void)
 esp_err_t esp_audio_play(const int16_t* data, int length, TickType_t ticks_to_wait)
 {
     return bsp_audio_play(data, length, ticks_to_wait);
+}
+
+esp_err_t esp_audio_flush(void)
+{
+#if CONFIG_ESP32_S3_MAX98357A_BOARD
+    return bsp_audio_flush();
+#else
+    /* 其它板型没有专用 flush：播约 300ms 静音排空 I2S DMA */
+    static int16_t silence[4800];
+    memset(silence, 0, sizeof(silence));
+    return bsp_audio_play(silence, (int)sizeof(silence), portMAX_DELAY);
+#endif
 }
 
 esp_err_t esp_audio_set_play_vol(int volume)

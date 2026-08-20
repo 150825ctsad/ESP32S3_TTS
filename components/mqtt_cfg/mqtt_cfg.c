@@ -28,7 +28,7 @@
 #include "cJSON.h"
 
 #define TAG                    "MQTT_CLIENT"
-#define MQTT_BROKER_URI        "mqtt://mqtt-xiaoyi.gejia.tech" //mqtt:mqtt-xiaoyi.gejia.tech wss:https://iot-xiaoyi.gejia.tech
+#define MQTT_BROKER_URI        "mqtt://mqtt:mqtt-xiaoyi.gejia.tech" //mqtt:mqtt-xiaoyi.gejia.tech wss:https://iot-xiaoyi.gejia.tech
 #define MQTT_BROKER_PORT       1883
 
 #define MQTT_USERNAME          "esp32s3"

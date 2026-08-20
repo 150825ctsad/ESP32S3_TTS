@@ -23,8 +23,10 @@ int app_main()
     /* 非阻塞 WiFi：GOT_IP 后 wifi_cfg 自动拉起 mqtt_task（环境数据上报 + /ws/ 地址） */
     wifi_init();
     vTaskDelay(1000);
-    /* 阻塞播放开机提示音（voice_data 分区 WAV） */
-    ws_cfg_play_tone();
+    /* 配网中已播 wificonfig 提示音，避免与开机欢迎音抢 I2S */
+    if (!wifi_is_provisioning()) {
+        ws_cfg_play_tone();
+    }
 
     while(1){
         vTaskDelay(1000);

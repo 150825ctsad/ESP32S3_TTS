@@ -25,7 +25,7 @@
 
 #define WS_URI_MAX          256
 #define WS_BUFFER_SIZE      2048   /* > 1024B PCM 帧 + JSON 帧，避免分片 */
-#define WS_NET_TIMEOUT_MS   10000
+#define WS_NET_TIMEOUT_MS   20000
 #define WS_TASK_STACK       8192
 #define WS_SEND_TIMEOUT_MS  100
 #define PLAY_HZ             16000

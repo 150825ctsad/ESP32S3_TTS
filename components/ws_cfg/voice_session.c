@@ -53,7 +53,7 @@
 #define VAD_RMS_THRESHOLD    300
 #define VAD_HANGOVER         32
 
-#define CONNECT_TIMEOUT_MS   3000
+#define CONNECT_TIMEOUT_MS   25000
 #define STREAM_MAX_MS        10000
 #define WAIT_TTS_TIMEOUT_MS  5000
 #define PLAY_MAX_MS          30000
@@ -76,6 +76,7 @@ static EventGroupHandle_t s_evt = NULL;
 static ringbuf_handle_t s_ring = NULL;
 static ringbuf_handle_t s_up_ring = NULL;
 static SemaphoreHandle_t s_afe_mux = NULL;
+static SemaphoreHandle_t s_play_mux = NULL;
 
 static const esp_wn_iface_t *s_wn = NULL;
 static model_iface_data_t *s_wn_data = NULL;
@@ -91,6 +92,8 @@ static esp_afe_sr_data_t *s_afe_vc_data = NULL;
 static int s_afe_vc_feed = 0;
 
 static volatile afe_pipe_t s_pipe = AFE_PIPE_WAKE;
+static volatile bool s_afe_fetch_en = true;
+static volatile int s_afe_chunks_fed = 0;
 static volatile sess_state_t s_state = SESS_IDLE;
 static char s_device[13] = "000000000000";
 static volatile bool s_had_speech = false;
@@ -108,6 +111,7 @@ static void afe_set_pipe(afe_pipe_t pipe)
 {
     if (s_afe_mux) xSemaphoreTake(s_afe_mux, portMAX_DELAY);
     s_pipe = pipe;
+    s_afe_chunks_fed = 0;
     if (pipe == AFE_PIPE_WAKE && s_afe_wake && s_afe_wake_data) {
         s_afe_wake->reset_buffer(s_afe_wake_data);
     }
@@ -117,6 +121,23 @@ static void afe_set_pipe(afe_pipe_t pipe)
     }
     if (s_afe_mux) xSemaphoreGive(s_afe_mux);
     s_had_speech = false;
+}
+
+/* 播放提示音/本地 TTS 时停 fetch，避免 session 阻塞期间空环告警 */
+static void afe_pause(void)
+{
+    s_afe_fetch_en = false;
+    if (s_afe_mux) xSemaphoreTake(s_afe_mux, portMAX_DELAY);
+    s_pipe = AFE_PIPE_OFF;
+    if (s_afe_mux) xSemaphoreGive(s_afe_mux);
+    /* 等正在进行的 fetch_with_delay(50ms) 返回后再停喂数侧的告警窗口 */
+    vTaskDelay(pdMS_TO_TICKS(60));
+}
+
+static void afe_resume(afe_pipe_t pipe)
+{
+    afe_set_pipe(pipe);
+    s_afe_fetch_en = true;
 }
 
 static void afe_feed_mono(const int16_t *mono, int nsamp)
@@ -153,7 +174,10 @@ static void afe_feed_mono(const int16_t *mono, int nsamp)
         if (acc_n < AFE_FEED_MAX) acc[acc_n++] = mono[i];
         if (acc_n >= chunk) {
             if (s_afe_mux) xSemaphoreTake(s_afe_mux, portMAX_DELAY);
-            if (s_pipe == pipe) iface->feed(data, acc);
+            if (s_pipe == pipe) {
+                iface->feed(data, acc);
+                s_afe_chunks_fed++;
+            }
             if (s_afe_mux) xSemaphoreGive(s_afe_mux);
             acc_n = 0;
         }
@@ -242,6 +266,16 @@ static void afe_fetch_task(void *arg)
 {
     (void)arg;
     for (;;) {
+        if (!s_afe_fetch_en || s_pipe == AFE_PIPE_OFF) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        /* reset 之后先等 feed 填了几块，再 fetch，避免 Ringbuffer empty */
+        if (s_afe_chunks_fed < 2) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
         afe_pipe_t pipe = s_pipe;
         afe_fetch_result_t *res = NULL;
 
@@ -287,11 +321,11 @@ static void play_local_tts_fallback(const char *text, bool *ok)
         return;
     }
     ESP_LOGI(TAG, "Fallback local TTS: %s", text);
-    afe_set_pipe(AFE_PIPE_OFF);
+    afe_pause();
     if (tts_play(text) == ESP_OK) {
         *ok = true;
     }
-    afe_set_pipe(AFE_PIPE_WAKE);
+    afe_resume(AFE_PIPE_WAKE);
 }
 
 static bool msgid_is_valid(const char *id)
@@ -340,7 +374,7 @@ static void session_teardown(bool normal)
         ESP_LOGW(TAG, "Abort playback");
     }
     ws_cfg_disconnect();
-    afe_set_pipe(AFE_PIPE_WAKE);
+    afe_resume(AFE_PIPE_WAKE);
     if (s_evt) {
         xEventGroupClearBits(s_evt, SESS_EVT_WAKE | SESS_EVT_VAD_END);
     }
@@ -363,12 +397,12 @@ static void start_cloud_session(TickType_t *t_connect_start, bool push)
         WS_EVT_CONNECTED | WS_EVT_DISCONNECTED |
         WS_EVT_TTS_DONE | WS_EVT_TTS_ERROR |
         SESS_EVT_WAKE | SESS_EVT_VAD_END | SESS_EVT_PUSH);
-    if (!push && s_afe_vc && s_afe_vc_data) afe_set_pipe(AFE_PIPE_VC);
+    afe_pause();
     if (ws_cfg_connect() == ESP_OK) {
         s_state = SESS_CONNECTING;
         *t_connect_start = xTaskGetTickCount();
     } else {
-        afe_set_pipe(AFE_PIPE_WAKE);
+        afe_resume(AFE_PIPE_WAKE);
         if (push) {
             session_teardown(false);
         } else {
@@ -587,6 +621,11 @@ static void session_task(void *arg)
                     break;
                 }
                 ESP_LOGI(TAG, "WS connected, start streaming");
+                if (s_afe_vc && s_afe_vc_data) {
+                    afe_resume(AFE_PIPE_VC);
+                } else {
+                    afe_resume(AFE_PIPE_WAKE);
+                }
                 char start_json[160];
                 snprintf(start_json, sizeof(start_json),
                     "{\"type\":\"start\",\"device\":\"%s\",\"wake\":\"nihaoxiaoyi\"}",
@@ -645,7 +684,7 @@ static void session_task(void *arg)
 
 stream_end:
             stream_send_end(tx_frame, &tx_n, t_stream_start);
-            afe_set_pipe(AFE_PIPE_WAKE);
+            afe_pause();
             s_state = SESS_WAIT_TTS;
             t_wait_start = xTaskGetTickCount();
             break;
@@ -706,10 +745,61 @@ stream_end:
 /*  提示音                                                           */
 /* ================================================================ */
 
+static esp_err_t play_wav_buf(const uint8_t *wav, size_t wav_size)
+{
+    uint32_t data_off = 0, data_len = 0;
+    if (wav == NULL || wav_size < 44 || memcmp(wav, "RIFF", 4) != 0 ||
+        memcmp(wav + 8, "WAVE", 4) != 0) {
+        ESP_LOGE(TAG, "Invalid WAV");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint32_t off = 12;
+    while (off + 8 <= wav_size) {
+        uint32_t size = wav[off + 4] | (wav[off + 5] << 8) |
+                        (wav[off + 6] << 16) | ((uint32_t)wav[off + 7] << 24);
+        if (memcmp(wav + off, "data", 4) == 0) {
+            data_off = off + 8;
+            data_len = size;
+            break;
+        }
+        off += 8 + size + (size & 1);
+    }
+
+    if (data_len == 0 || data_off + data_len > wav_size) {
+        ESP_LOGE(TAG, "Invalid WAV data chunk");
+        return ESP_FAIL;
+    }
+
+    uint32_t pos = 0;
+    int16_t ram[512];
+    while (pos < data_len) {
+        uint32_t chunk = data_len - pos > sizeof(ram) ? sizeof(ram) : data_len - pos;
+        memcpy(ram, wav + data_off + pos, chunk);
+        /* 只读区（mmap/嵌入二进制）：EQ/软音量会就地改写，必须先拷到 RAM */
+        esp_audio_play(ram, (int)chunk, portMAX_DELAY);
+        pos += chunk;
+    }
+    ESP_LOGI(TAG, "WAV played (%u bytes)", (unsigned)data_len);
+    return ESP_OK;
+}
+
+esp_err_t ws_cfg_play_wav(const uint8_t *wav, size_t wav_size)
+{
+    if (s_play_mux) xSemaphoreTake(s_play_mux, portMAX_DELAY);
+    afe_pipe_t prev = s_pipe;
+    afe_pause();
+    esp_err_t ret = play_wav_buf(wav, wav_size);
+    afe_resume(prev == AFE_PIPE_OFF ? AFE_PIPE_WAKE : prev);
+    if (s_play_mux) xSemaphoreGive(s_play_mux);
+    return ret;
+}
+
 esp_err_t ws_cfg_play_tone(void)
 {
+    if (s_play_mux) xSemaphoreTake(s_play_mux, portMAX_DELAY);
     afe_pipe_t prev = s_pipe;
-    afe_set_pipe(AFE_PIPE_OFF);
+    afe_pause();
     esp_err_t ret = ESP_FAIL;
 
     const esp_partition_t *part = esp_partition_find_first(
@@ -727,44 +817,12 @@ esp_err_t ws_cfg_play_tone(void)
         goto out;
     }
 
-    const uint8_t *wav = (const uint8_t *)map;
-    uint32_t data_off = 0, data_len = 0;
-    if (part->size >= 44 && memcmp(wav, "RIFF", 4) == 0 &&
-        memcmp(wav + 8, "WAVE", 4) == 0) {
-        uint32_t off = 12;
-        while (off + 8 <= part->size) {
-            uint32_t size = wav[off + 4] | (wav[off + 5] << 8) |
-                            (wav[off + 6] << 16) | ((uint32_t)wav[off + 7] << 24);
-            if (memcmp(wav + off, "data", 4) == 0) {
-                data_off = off + 8;
-                data_len = size;
-                break;
-            }
-            off += 8 + size + (size & 1);
-        }
-    }
-
-    if (data_len == 0 || data_off + data_len > part->size) {
-        ESP_LOGE(TAG, "Invalid WAV in partition");
-        esp_partition_munmap(map_handle);
-        goto out;
-    }
-
-    uint32_t pos = 0;
-    int16_t ram[512];
-    while (pos < data_len) {
-        uint32_t chunk = data_len - pos > sizeof(ram) ? sizeof(ram) : data_len - pos;
-        memcpy(ram, wav + data_off + pos, chunk);
-        /* mmap 区只读：EQ/软音量会就地改写，必须先拷到 RAM */
-        esp_audio_play(ram, (int)chunk, portMAX_DELAY);
-        pos += chunk;
-    }
+    ret = play_wav_buf((const uint8_t *)map, part->size);
     esp_partition_munmap(map_handle);
-    ESP_LOGI(TAG, "Tone played (%u bytes)", data_len);
-    ret = ESP_OK;
 
 out:
-    afe_set_pipe(prev);
+    afe_resume(prev == AFE_PIPE_OFF ? AFE_PIPE_WAKE : prev);
+    if (s_play_mux) xSemaphoreGive(s_play_mux);
     return ret;
 }
 
@@ -778,7 +836,8 @@ esp_err_t ws_cfg_init(void)
     if (s_ring == NULL) s_ring = rb_create(RING_BLOCK_SIZE, RING_N_BLOCKS);
     if (s_up_ring == NULL) s_up_ring = rb_create(RING_BLOCK_SIZE, UP_RING_BLOCKS);
     if (s_afe_mux == NULL) s_afe_mux = xSemaphoreCreateMutex();
-    if (s_evt == NULL || s_ring == NULL || s_up_ring == NULL || s_afe_mux == NULL) {
+    if (s_play_mux == NULL) s_play_mux = xSemaphoreCreateMutex();
+    if (s_evt == NULL || s_ring == NULL || s_up_ring == NULL || s_afe_mux == NULL || s_play_mux == NULL) {
         ESP_LOGE(TAG, "Event group / ringbuf / mutex create failed");
         return ESP_ERR_NO_MEM;
     }

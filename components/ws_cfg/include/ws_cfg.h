@@ -2,6 +2,8 @@
 #define __WS_CFG_H
 
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 #include "esp_err.h"
 
 /**
@@ -40,5 +42,12 @@ void ws_cfg_set_push_done_cb(ws_cfg_push_done_cb_t cb);
  * 阻塞播放直到结束。用于开机欢迎音、唤醒无地址提示、连接失败提示。
  */
 esp_err_t ws_cfg_play_tone(void);
+
+/**
+ * @brief 播放内存中的 WAV（16kHz/16bit/mono PCM）
+ *
+ * 阻塞播放直到结束。播放期间暂停 AFE。
+ */
+esp_err_t ws_cfg_play_wav(const uint8_t *wav, size_t wav_size);
 
 #endif // __WS_CFG_H
