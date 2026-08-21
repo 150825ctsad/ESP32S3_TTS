@@ -6,8 +6,9 @@
  *
  * 状态机：
  *   IDLE ──AFE 唤醒──▶ CONNECTING ──连接成功──▶ STREAMING ──VAD静音/10s──▶ WAIT_TTS
- *     ▲                     │(3s超时: 提示音)                              │(5s超时)
+ *     ▲                     │(25s超时: 提示音)                              │(推送15s/对讲5s)
  *     └── done/error ◀── PLAYING ◀── TTS PCM
+ *   MQTT 推送：IDLE ──PUSH──▶ CONNECTING ──▶ WAIT_TTS（跳过上行）
  ******************************************************************************/
 #include <stdio.h>
 #include <string.h>
@@ -101,6 +102,10 @@ static volatile bool s_had_speech = false;
 static char s_push_msgid[80];
 static char s_push_tts[768];
 static volatile bool s_push_active = false;
+static char s_pending_msgid[80];
+static char s_pending_tts[768];
+static volatile bool s_push_pending = false;
+static SemaphoreHandle_t s_push_mux = NULL;
 static ws_cfg_push_done_cb_t s_push_done_cb = NULL;
 
 /* ================================================================ */
@@ -345,6 +350,23 @@ static bool msgid_is_valid(const char *id)
     return false;
 }
 
+static void push_promote_pending(void)
+{
+    if (!s_push_pending) {
+        return;
+    }
+    snprintf(s_push_msgid, sizeof(s_push_msgid), "%s", s_pending_msgid);
+    snprintf(s_push_tts, sizeof(s_push_tts), "%s", s_pending_tts);
+    s_pending_msgid[0] = '\0';
+    s_pending_tts[0] = '\0';
+    s_push_pending = false;
+    if (s_evt) {
+        xEventGroupSetBits(s_evt, SESS_EVT_PUSH);
+    }
+    ESP_LOGI(TAG, "Pending push promoted (msgId=%s)",
+             s_push_msgid[0] ? s_push_msgid : "-");
+}
+
 static void session_teardown(bool normal)
 {
     char msgid[sizeof(s_push_msgid)];
@@ -352,6 +374,7 @@ static void session_teardown(bool normal)
     bool was_push = s_push_active;
     msgid[0] = '\0';
     tts[0] = '\0';
+    if (s_push_mux) xSemaphoreTake(s_push_mux, portMAX_DELAY);
     if (was_push) {
         snprintf(msgid, sizeof(msgid), "%s", s_push_msgid);
         snprintf(tts, sizeof(tts), "%s", s_push_tts);
@@ -359,6 +382,7 @@ static void session_teardown(bool normal)
         s_push_msgid[0] = '\0';
         s_push_tts[0] = '\0';
     }
+    if (s_push_mux) xSemaphoreGive(s_push_mux);
 
     if (normal) {
         rb_done_write(s_ring);
@@ -388,17 +412,26 @@ static void session_teardown(bool normal)
     if (was_push && msgid[0] && s_push_done_cb) {
         s_push_done_cb(msgid, ok);
     }
+
+    if (s_push_mux) xSemaphoreTake(s_push_mux, portMAX_DELAY);
+    push_promote_pending();
+    if (s_push_mux) xSemaphoreGive(s_push_mux);
 }
 
 static void start_cloud_session(TickType_t *t_connect_start, bool push)
 {
+    if (s_push_mux) xSemaphoreTake(s_push_mux, portMAX_DELAY);
     s_push_active = push;
+    if (s_push_mux) xSemaphoreGive(s_push_mux);
     xEventGroupClearBits(s_evt,
         WS_EVT_CONNECTED | WS_EVT_DISCONNECTED |
         WS_EVT_TTS_DONE | WS_EVT_TTS_ERROR |
-        SESS_EVT_WAKE | SESS_EVT_VAD_END | SESS_EVT_PUSH);
+        SESS_EVT_WAKE | SESS_EVT_VAD_END);
+    if (push) {
+        xEventGroupClearBits(s_evt, SESS_EVT_PUSH);
+    }
     afe_pause();
-    if (ws_cfg_connect() == ESP_OK) {
+    if (ws_cfg_connect(push) == ESP_OK) {
         s_state = SESS_CONNECTING;
         *t_connect_start = xTaskGetTickCount();
     } else {
@@ -406,8 +439,10 @@ static void start_cloud_session(TickType_t *t_connect_start, bool push)
         if (push) {
             session_teardown(false);
         } else {
-            ws_cfg_play_tone();
+            if (s_push_mux) xSemaphoreTake(s_push_mux, portMAX_DELAY);
             s_push_active = false;
+            if (s_push_mux) xSemaphoreGive(s_push_mux);
+            ws_cfg_play_tone();
         }
     }
 }
@@ -423,13 +458,33 @@ esp_err_t ws_cfg_request_push(const char *msg_id, const char *tts_text)
         ESP_LOGE(TAG, "Voice session not ready");
         return ESP_ERR_INVALID_STATE;
     }
-    if (!ws_cfg_has_uri() && (tts_text == NULL || tts_text[0] == '\0')) {
+    if (!ws_cfg_has_push_uri() && !ws_cfg_has_uri() &&
+        (tts_text == NULL || tts_text[0] == '\0')) {
         ESP_LOGE(TAG, "No ws uri and no tts text for push");
         return ESP_ERR_INVALID_STATE;
+    }
+
+    if (s_push_mux) xSemaphoreTake(s_push_mux, portMAX_DELAY);
+    bool busy = s_push_active ||
+                (s_evt && (xEventGroupGetBits(s_evt) & SESS_EVT_PUSH));
+    if (busy) {
+        if (s_push_pending) {
+            if (s_push_mux) xSemaphoreGive(s_push_mux);
+            ESP_LOGW(TAG, "Push busy, drop (msgId=%s)", msg_id ? msg_id : "-");
+            return ESP_ERR_INVALID_STATE;
+        }
+        snprintf(s_pending_msgid, sizeof(s_pending_msgid), "%s", msg_id ? msg_id : "");
+        snprintf(s_pending_tts, sizeof(s_pending_tts), "%s", tts_text ? tts_text : "");
+        s_push_pending = true;
+        if (s_push_mux) xSemaphoreGive(s_push_mux);
+        ESP_LOGI(TAG, "Push TTS deferred (msgId=%s)",
+                 s_pending_msgid[0] ? s_pending_msgid : "-");
+        return ESP_OK;
     }
     snprintf(s_push_msgid, sizeof(s_push_msgid), "%s", msg_id ? msg_id : "");
     snprintf(s_push_tts, sizeof(s_push_tts), "%s", tts_text ? tts_text : "");
     xEventGroupSetBits(s_evt, SESS_EVT_PUSH);
+    if (s_push_mux) xSemaphoreGive(s_push_mux);
     ESP_LOGI(TAG, "Push TTS queued (msgId=%s)", s_push_msgid[0] ? s_push_msgid : "-");
     return ESP_OK;
 }
@@ -539,7 +594,8 @@ static void session_task(void *arg)
         case SESS_IDLE:
             if (xEventGroupGetBits(s_evt) & SESS_EVT_PUSH) {
                 xEventGroupClearBits(s_evt, SESS_EVT_PUSH);
-                bool use_cloud = msgid_is_valid(s_push_msgid) && ws_cfg_has_uri();
+                bool use_cloud = msgid_is_valid(s_push_msgid) &&
+                                 (ws_cfg_has_push_uri() || ws_cfg_has_uri());
                 if (!use_cloud) {
                     ESP_LOGW(TAG, "msgId invalid or no WS, local TTS (msgId=%s)",
                              s_push_msgid[0] ? s_push_msgid : "-");
@@ -562,7 +618,7 @@ static void session_task(void *arg)
                 if (xEventGroupGetBits(s_evt) & SESS_EVT_WAKE) {
                     xEventGroupClearBits(s_evt, SESS_EVT_WAKE);
                     if (!ws_cfg_has_uri()) {
-                        ESP_LOGW(TAG, "No ws uri yet, tone and ignore");
+                        ESP_LOGW(TAG, "No dialog ws uri yet, tone and ignore");
                         ws_cfg_play_tone();
                         break;
                     }
@@ -583,7 +639,7 @@ static void session_task(void *arg)
                         ESP_LOGI(TAG, "!!! Wake word detected (raw WN) !!!");
                         wn_n = 0;
                         if (!ws_cfg_has_uri()) {
-                            ESP_LOGW(TAG, "No ws uri yet, tone and ignore");
+                            ESP_LOGW(TAG, "No dialog ws uri yet, tone and ignore");
                             ws_cfg_play_tone();
                             break;
                         }
@@ -837,7 +893,9 @@ esp_err_t ws_cfg_init(void)
     if (s_up_ring == NULL) s_up_ring = rb_create(RING_BLOCK_SIZE, UP_RING_BLOCKS);
     if (s_afe_mux == NULL) s_afe_mux = xSemaphoreCreateMutex();
     if (s_play_mux == NULL) s_play_mux = xSemaphoreCreateMutex();
-    if (s_evt == NULL || s_ring == NULL || s_up_ring == NULL || s_afe_mux == NULL || s_play_mux == NULL) {
+    if (s_push_mux == NULL) s_push_mux = xSemaphoreCreateMutex();
+    if (s_evt == NULL || s_ring == NULL || s_up_ring == NULL || s_afe_mux == NULL ||
+        s_play_mux == NULL || s_push_mux == NULL) {
         ESP_LOGE(TAG, "Event group / ringbuf / mutex create failed");
         return ESP_ERR_NO_MEM;
     }

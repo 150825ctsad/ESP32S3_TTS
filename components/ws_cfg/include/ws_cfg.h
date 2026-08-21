@@ -17,12 +17,16 @@ esp_err_t ws_cfg_init(void);
 /**
  * @brief 保存 WebSocket 地址（mqtt_cfg 收到 /ws/ 路径时调用）
  *
+ * 含 /tcm/ 的路径只用于云端 TTS 推送；其它路径用于唤醒对讲。
  * 内部把 https:// 归一化为 wss://。
  */
 esp_err_t ws_cfg_set_uri(const char *uri);
 
-/** @brief 是否已有可用的 WebSocket 地址 */
+/** @brief 是否已有唤醒对讲 WebSocket 地址（不含 TCM 推送通道） */
 bool ws_cfg_has_uri(void);
+
+/** @brief 是否已有云端 TTS 推送地址 */
+bool ws_cfg_has_push_uri(void);
 
 /**
  * @brief 云端下发 ws 后立刻发起一次 TTS 播放会话（不走麦克风上行）

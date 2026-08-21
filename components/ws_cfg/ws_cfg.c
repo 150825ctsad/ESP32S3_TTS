@@ -34,7 +34,9 @@
 #define PCM_WRITE_WAIT_MS   1000
 
 static esp_websocket_client_handle_t s_client = NULL;
-static char s_uri[WS_URI_MAX] = {0};
+static char s_uri_dialog[WS_URI_MAX] = {0};
+static char s_uri_push[WS_URI_MAX] = {0};
+static char s_uri_active[WS_URI_MAX] = {0};
 
 static EventGroupHandle_t s_evt = NULL;
 static ringbuf_handle_t s_ring = NULL;
@@ -199,7 +201,7 @@ static void ws_event_cb(void *arg, esp_event_base_t base,
 
     switch (event_id) {
     case WEBSOCKET_EVENT_CONNECTED:
-        ESP_LOGI(TAG, "Connected: %s", s_uri);
+        ESP_LOGI(TAG, "Connected: %s", s_uri_active);
         if (s_evt) xEventGroupSetBits(s_evt, WS_EVT_CONNECTED);
         break;
 
@@ -303,21 +305,33 @@ esp_err_t ws_cfg_set_uri(const char *uri)
         ESP_LOGE(TAG, "Invalid uri");
         return ESP_ERR_INVALID_ARG;
     }
+    char tmp[WS_URI_MAX];
     /* 归一化 https:// → wss://，http:// → ws://（mqtt_cfg 拼出 https://） */
     if (strncmp(uri, "https://", 8) == 0) {
-        snprintf(s_uri, sizeof(s_uri), "wss://%s", uri + 8);
+        snprintf(tmp, sizeof(tmp), "wss://%s", uri + 8);
     } else if (strncmp(uri, "http://", 7) == 0) {
-        snprintf(s_uri, sizeof(s_uri), "ws://%s", uri + 7);
+        snprintf(tmp, sizeof(tmp), "ws://%s", uri + 7);
     } else {
-        snprintf(s_uri, sizeof(s_uri), "%s", uri);
+        snprintf(tmp, sizeof(tmp), "%s", uri);
     }
-    ESP_LOGI(TAG, "WS uri saved: %s", s_uri);
+    if (strstr(tmp, "/tcm/") != NULL) {
+        snprintf(s_uri_push, sizeof(s_uri_push), "%s", tmp);
+        ESP_LOGI(TAG, "WS push uri saved: %s", s_uri_push);
+    } else {
+        snprintf(s_uri_dialog, sizeof(s_uri_dialog), "%s", tmp);
+        ESP_LOGI(TAG, "WS dialog uri saved: %s", s_uri_dialog);
+    }
     return ESP_OK;
 }
 
 bool ws_cfg_has_uri(void)
 {
-    return s_uri[0] != '\0';
+    return s_uri_dialog[0] != '\0';
+}
+
+bool ws_cfg_has_push_uri(void)
+{
+    return s_uri_push[0] != '\0';
 }
 
 /* ================================================================ */
@@ -330,19 +344,26 @@ void ws_cfg_attach(EventGroupHandle_t evt, ringbuf_handle_t ring)
     s_ring = ring;
 }
 
-esp_err_t ws_cfg_connect(void)
+esp_err_t ws_cfg_connect(bool push)
 {
     if (s_client != NULL) {
         ESP_LOGW(TAG, "Already connecting/connected");
         return ESP_ERR_INVALID_STATE;
     }
-    if (!ws_cfg_has_uri()) {
-        ESP_LOGE(TAG, "No uri saved");
+    const char *uri = NULL;
+    if (push) {
+        uri = s_uri_push[0] ? s_uri_push : (s_uri_dialog[0] ? s_uri_dialog : NULL);
+    } else {
+        uri = s_uri_dialog[0] ? s_uri_dialog : NULL;
+    }
+    if (uri == NULL) {
+        ESP_LOGE(TAG, "No %s uri saved", push ? "push" : "dialog");
         return ESP_ERR_INVALID_STATE;
     }
+    snprintf(s_uri_active, sizeof(s_uri_active), "%s", uri);
 
     const esp_websocket_client_config_t cfg = {
-        .uri = s_uri,
+        .uri = s_uri_active,
         .buffer_size = WS_BUFFER_SIZE,
         .network_timeout_ms = WS_NET_TIMEOUT_MS,
         .task_stack = WS_TASK_STACK,
@@ -365,7 +386,7 @@ esp_err_t ws_cfg_connect(void)
         s_client = NULL;
         return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "WS connecting: %s", s_uri);
+    ESP_LOGI(TAG, "WS connecting (%s): %s", push ? "push" : "dialog", s_uri_active);
     return ESP_OK;
 }
 

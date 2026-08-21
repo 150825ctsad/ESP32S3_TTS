@@ -28,9 +28,8 @@
 #include "cJSON.h"
 
 #define TAG                    "MQTT_CLIENT"
-#define MQTT_BROKER_URI        "mqtt://mqtt:mqtt-xiaoyi.gejia.tech" //mqtt:mqtt-xiaoyi.gejia.tech wss:https://iot-xiaoyi.gejia.tech
+#define MQTT_BROKER_URI        "mqtt://192.168.1.200"       //mqtt-xiaoyi.gejia.tech
 #define MQTT_BROKER_PORT       1883
-
 #define MQTT_USERNAME          "esp32s3"
 #define MQTT_PASSWORD          ""
 #define MQTT_MAX_PAYLOAD       2048
@@ -164,7 +163,8 @@ static void handle_command(const char *msg_str)
     /* 含 /ws/ 路径：保存地址并立刻连 WS 播放，完成后回传 msgId */
     const char *msgid = NULL;
     const char *tts_text = NULL;
-    cJSON *jmsgid = cJSON_GetObjectItemCaseSensitive(root, "msgId");
+    /* 云端可能发 msgId / msgID */
+    cJSON *jmsgid = cJSON_GetObjectItem(root, "msgId");
     if (cJSON_IsString(jmsgid) && jmsgid->valuestring) msgid = jmsgid->valuestring;
     cJSON *jtts = cJSON_GetObjectItemCaseSensitive(root, "tts");
     if (cJSON_IsString(jtts) && jtts->valuestring) tts_text = jtts->valuestring;

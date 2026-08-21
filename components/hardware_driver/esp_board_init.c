@@ -25,11 +25,32 @@
 #include "string.h"
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
-static const char *TAG = "hardware";
+static SemaphoreHandle_t s_i2s_play_mux = NULL;
+
+static void i2s_play_lock(void)
+{
+    if (s_i2s_play_mux == NULL) {
+        s_i2s_play_mux = xSemaphoreCreateMutex();
+    }
+    if (s_i2s_play_mux) {
+        xSemaphoreTake(s_i2s_play_mux, portMAX_DELAY);
+    }
+}
+
+static void i2s_play_unlock(void)
+{
+    if (s_i2s_play_mux) {
+        xSemaphoreGive(s_i2s_play_mux);
+    }
+}
 
 esp_err_t esp_board_init(uint32_t sample_rate, int channel_format, int bits_per_chan)
 {
+    if (s_i2s_play_mux == NULL) {
+        s_i2s_play_mux = xSemaphoreCreateMutex();
+    }
     return bsp_board_init(sample_rate, channel_format, bits_per_chan);
 }
 
@@ -60,19 +81,25 @@ char* esp_get_input_format(void)
 
 esp_err_t esp_audio_play(const int16_t* data, int length, TickType_t ticks_to_wait)
 {
-    return bsp_audio_play(data, length, ticks_to_wait);
+    i2s_play_lock();
+    esp_err_t r = bsp_audio_play(data, length, ticks_to_wait);
+    i2s_play_unlock();
+    return r;
 }
 
 esp_err_t esp_audio_flush(void)
 {
+    i2s_play_lock();
 #if CONFIG_ESP32_S3_MAX98357A_BOARD
-    return bsp_audio_flush();
+    esp_err_t r = bsp_audio_flush();
 #else
     /* 其它板型没有专用 flush：播约 300ms 静音排空 I2S DMA */
     static int16_t silence[4800];
     memset(silence, 0, sizeof(silence));
-    return bsp_audio_play(silence, (int)sizeof(silence), portMAX_DELAY);
+    esp_err_t r = bsp_audio_play(silence, (int)sizeof(silence), portMAX_DELAY);
 #endif
+    i2s_play_unlock();
+    return r;
 }
 
 esp_err_t esp_audio_set_play_vol(int volume)

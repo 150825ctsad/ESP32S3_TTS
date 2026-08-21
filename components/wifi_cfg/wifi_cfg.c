@@ -68,6 +68,7 @@ extern const uint8_t wificonfig_wav_end[]   asm("_binary_wificonfig_wav_end");
 #define AP_PASSWORD             ""
 #define AP_MAX_CONN             4
 #define AP_IP                   "192.168.4.1"
+#define CAPTIVE_REDIRECT        "http://" AP_IP "/"
 
 /* ---- STA connect ---- */
 #define STA_TIMEOUT_MS          15000
@@ -86,6 +87,7 @@ static volatile bool     s_provisioning = false; /* SoftAP portal active */
 static volatile bool     s_exiting = false;      /* guard against duplicate /exit */
 static bool              s_mqtt_started = false; /* 防止重复创建 MQTT 任务 */
 static volatile bool     s_dns_running = false;
+static volatile bool     s_skip_reconnect = false; /* 主动 disconnect/换配置期间禁止重连 */
 static int               s_dns_fd = -1;
 static TaskHandle_t      s_dns_task = NULL;
 
@@ -106,6 +108,28 @@ static void exit_config_task(void *arg);
 static bool memiszero(const uint8_t *p, size_t n) {
     for (size_t i = 0; i < n; i++) if (p[i]) return false;
     return true;
+}
+
+static const char *sta_disc_str(uint8_t reason)
+{
+    switch (reason) {
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+        return "4-way handshake timeout (password?)";
+    case WIFI_REASON_NO_AP_FOUND:
+        return "AP not found";
+    case WIFI_REASON_AUTH_FAIL:
+        return "auth fail";
+    case WIFI_REASON_ASSOC_LEAVE:
+        return "left AP";
+    case WIFI_REASON_BEACON_TIMEOUT:
+        return "beacon timeout";
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+        return "handshake timeout";
+    case WIFI_REASON_CONNECTION_FAIL:
+        return "connection fail";
+    default:
+        return "other";
+    }
 }
 
 /* parse ?index=N from a query string; returns -1 on failure */
@@ -146,17 +170,6 @@ static uint8_t nvs_saved_count(void)
     nvs_get_u8(h, NVS_KEY_COUNT, &v);
     nvs_close(h);
     return v > MAX_SAVED ? MAX_SAVED : v;
-}
-
-static esp_err_t nvs_saved_count_set(uint8_t n)
-{
-    nvs_handle_t h;
-    esp_err_t e = nvs_open(NVS_NS, NVS_READWRITE, &h);
-    if (e != ESP_OK) return e;
-    e = nvs_set_u8(h, NVS_KEY_COUNT, n > MAX_SAVED ? MAX_SAVED : n);
-    e |= nvs_commit(h);
-    nvs_close(h);
-    return e;
 }
 
 /* read i-th saved SSID & password; index 0 is the "default" (tried first) */
@@ -265,16 +278,6 @@ static esp_err_t nvs_saved_set_default(int idx)
         return ESP_ERR_NOT_FOUND;
     nvs_saved_delete(idx);
     return nvs_saved_push_front(ssid, pass, bssid);
-}
-
-/* erase all saved */
-static void nvs_saved_clear(void)
-{
-    nvs_handle_t h;
-    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
-    nvs_erase_all(h);
-    nvs_commit(h);
-    nvs_close(h);
 }
 
 /* ================================================================ */
@@ -408,13 +411,19 @@ static esp_err_t h_done(httpd_req_t *req) {
     return ESP_OK;
 }
 
-/* 404 → redirect to / */
-static esp_err_t h_404(httpd_req_t *req, httpd_err_code_t err) {
-    httpd_resp_set_hdr(req, "Connection", "close");
+/* 404 / captive-portal probes → redirect to config page */
+static esp_err_t h_captive(httpd_req_t *req) {
     httpd_resp_set_status(req, "302 Found");
-    httpd_resp_set_hdr(req, "Location", "/");
+    httpd_resp_set_hdr(req, "Location", CAPTIVE_REDIRECT);
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Connection", "close");
     httpd_resp_send(req, NULL, 0);
     return ESP_OK;
+}
+
+static esp_err_t h_404(httpd_req_t *req, httpd_err_code_t err) {
+    (void)err;
+    return h_captive(req);
 }
 
 /* GET /scan */
@@ -541,9 +550,11 @@ static esp_err_t h_submit(httpd_req_t *req) {
 
     /* drain stale semaphore, then try to connect */
     xSemaphoreTake(s_ip_sem, 0);
+    s_skip_reconnect = true;
     esp_wifi_disconnect();
     esp_wifi_set_config(ESP_IF_WIFI_STA, &cfg);
     esp_wifi_connect();
+    s_skip_reconnect = false;
 
     bool ok = (xSemaphoreTake(s_ip_sem, pdMS_TO_TICKS(STA_TIMEOUT_MS)) == pdTRUE);
 
@@ -562,10 +573,14 @@ static esp_err_t h_submit(httpd_req_t *req) {
         /* Keep AP + HTTP alive for /done.html and POST /exit.
          * Drop the test STA session so MQTT does not start until
          * config mode actually exits (xiaozhi-style, no reboot). */
+        s_skip_reconnect = true;
         esp_wifi_disconnect();
+        s_skip_reconnect = false;
         s_connecting = false;
     } else {
+        s_skip_reconnect = true;
         esp_wifi_disconnect();
+        s_skip_reconnect = false;
         s_connecting = false;
         snprintf(resp, sizeof(resp), "{\"success\":false,\"error\":\"Connection timeout\"}");
         send_json(req, resp);
@@ -635,7 +650,7 @@ static void http_start(void)
 {
     if (s_httpd) return;
     httpd_config_t c = HTTPD_DEFAULT_CONFIG();
-    c.max_uri_handlers   = 16;
+    c.max_uri_handlers   = 24;
     c.max_open_sockets   = 13;
     c.lru_purge_enable   = true;
     c.stack_size         = 8192;
@@ -663,6 +678,27 @@ static void http_start(void)
     httpd_register_uri_handler(s_httpd, &uri_adv_submit);
     httpd_register_uri_handler(s_httpd, &uri_exit);
 
+    /* Windows/Android/iOS 连通性探测，避免 404 刷屏并弹出配网页 */
+    static const char *captive_paths[] = {
+        "/connecttest.txt",
+        "/ncsi.txt",
+        "/generate_204",
+        "/gen_204",
+        "/204",
+        "/hotspot-detect.html",
+        "/success.txt",
+        "/canonical.html",
+    };
+    for (size_t i = 0; i < sizeof(captive_paths) / sizeof(captive_paths[0]); i++) {
+        const httpd_uri_t u = {
+            .uri = captive_paths[i],
+            .method = HTTP_GET,
+            .handler = h_captive,
+            .user_ctx = NULL,
+        };
+        httpd_register_uri_handler(s_httpd, &u);
+    }
+
     httpd_register_err_handler(s_httpd, HTTPD_404_NOT_FOUND, h_404);
     ESP_LOGI(TAG, "HTTP server ready at http://%s", AP_IP);
 }
@@ -683,16 +719,31 @@ static void ev_handler(void *arg, esp_event_base_t base,
 {
     if (base == WIFI_EVENT) {
         switch (id) {
-        case WIFI_EVENT_STA_START: esp_wifi_connect(); break;
+        case WIFI_EVENT_STA_START:
+            /* 不在这里 connect：APSTA 启动时会带上 NVS 里的旧 STA 配置，
+             * 配网阶段会误连并刷 4-way handshake timeout。由 sta_try / 重连逻辑发起。 */
+            break;
         case WIFI_EVENT_STA_CONNECTED:
             ESP_LOGI(TAG, "Connected: %.*s",
                      ((wifi_event_sta_connected_t*)data)->ssid_len,
                      ((wifi_event_sta_connected_t*)data)->ssid);
             break;
-        case WIFI_EVENT_STA_DISCONNECTED:
-            ESP_LOGW(TAG, "Disconnected: %d",
-                     ((wifi_event_sta_disconnected_t*)data)->reason);
+        case WIFI_EVENT_STA_DISCONNECTED: {
+            wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)data;
+            ESP_LOGW(TAG, "Disconnected: %d (%s)", d->reason, sta_disc_str(d->reason));
+            /* 配网门户期间保持 STA 断开，避免试连成功后又被拉起来抢 MQTT */
+            if (s_skip_reconnect || s_provisioning) {
+                break;
+            }
+            wifi_config_t sta_cfg;
+            if (esp_wifi_get_config(WIFI_IF_STA, &sta_cfg) != ESP_OK ||
+                sta_cfg.sta.ssid[0] == 0) {
+                break;
+            }
+            ESP_LOGI(TAG, "STA reconnecting to \"%s\"", sta_cfg.sta.ssid);
+            esp_wifi_connect();
             break;
+        }
         case WIFI_EVENT_AP_STACONNECTED:
             ESP_LOGI(TAG, "AP client " MACSTR,
                      MAC2STR(((wifi_event_ap_staconnected_t*)data)->mac));
@@ -753,12 +804,18 @@ static bool sta_try(const char *ssid, const char *pass, const uint8_t *bssid)
         cfg.sta.bssid_set = true;
     }
 
+    s_skip_reconnect = true;
     esp_wifi_disconnect();
     esp_wifi_set_config(ESP_IF_WIFI_STA, &cfg);
     esp_wifi_connect();
+    s_skip_reconnect = false;
 
     bool ok = (xSemaphoreTake(s_ip_sem, pdMS_TO_TICKS(STA_TIMEOUT_MS)) == pdTRUE);
-    if (!ok) esp_wifi_disconnect();
+    if (!ok) {
+        s_skip_reconnect = true;
+        esp_wifi_disconnect();
+        s_skip_reconnect = false;
+    }
     return ok;
 }
 
@@ -782,6 +839,12 @@ static void start_provisioning(void)
     }
     s_provisioning = true;
     ESP_LOGI(TAG, "Starting HTTP + DNS for provisioning (no reboot)");
+    /* 停掉 STA 误连（wifi_start 可能带上 IDF NVS 里的旧凭证） */
+    s_skip_reconnect = true;
+    esp_wifi_disconnect();
+    wifi_config_t empty = {0};
+    esp_wifi_set_config(WIFI_IF_STA, &empty);
+    s_skip_reconnect = false;
     http_start();
     dns_start();
     xTaskCreatePinnedToCore(play_wificonfig_task, "wifi_cfg_tone", 4096, NULL, 5, NULL, 1);

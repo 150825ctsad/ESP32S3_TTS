@@ -6,7 +6,6 @@ idf_component_register( SRCS
 
                         REQUIRES
                         button
-                        relay
                         wifi_cfg
                         ws_cfg
                         sr_ringbuf

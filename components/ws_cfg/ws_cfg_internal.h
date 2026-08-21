@@ -24,8 +24,11 @@ void ws_cfg_attach(EventGroupHandle_t evt, ringbuf_handle_t ring);
 
 /* ---------- transport API（仅 voice_session 使用） ---------- */
 
-/** @brief 用已保存的地址建立 WS 连接（异步，成功由 WS_EVT_CONNECTED 通知） */
-esp_err_t ws_cfg_connect(void);
+/** @brief 用已保存的地址建立 WS 连接（异步，成功由 WS_EVT_CONNECTED 通知）
+ *
+ *  @param push  true：连 TCM 推送通道；false：连唤醒对讲通道
+ */
+esp_err_t ws_cfg_connect(bool push);
 
 /** @brief 会话结束：断开并释放客户端（主动断开不产生 WS_EVT_DISCONNECTED 处理需求） */
 esp_err_t ws_cfg_disconnect(void);
