@@ -30,6 +30,8 @@ static esp_tts_handle_t s_tts = NULL;
 static QueueHandle_t s_queue = NULL;
 static SemaphoreHandle_t s_done = NULL;
 static volatile esp_err_t s_result = ESP_FAIL;
+static volatile bool s_tts_abort = false;
+static volatile bool s_tts_busy = false;
 
 static void fade_in(int16_t *pcm, int n)
 {
@@ -66,16 +68,22 @@ static esp_err_t tts_speak(const char *text)
     bool first = true;
 
     while (1) {
+        if (s_tts_abort) {
+            ESP_LOGW(TAG, "aborted");
+            break;
+        }
         short *pcm = esp_tts_stream_play(s_tts, &len, TTS_SPEECH_SPEED);
         if (pcm == NULL || len <= 0) break;
 
         if (tail_n > 0) {
+            if (s_tts_abort) break;
             esp_audio_play(tail, tail_n * (int)sizeof(int16_t), portMAX_DELAY);
             total_bytes += tail_n * (int)sizeof(int16_t);
         }
 
         int16_t *tmp = realloc(tail, (size_t)len * sizeof(int16_t));
         if (tmp == NULL) {
+            if (s_tts_abort) break;
             if (first) fade_in((int16_t *)pcm, len);
             esp_audio_play((int16_t *)pcm, len * (int)sizeof(int16_t), portMAX_DELAY);
             total_bytes += len * (int)sizeof(int16_t);
@@ -92,14 +100,21 @@ static esp_err_t tts_speak(const char *text)
         }
     }
 
-    if (tail_n > 0) {
+    if (tail_n > 0 && !s_tts_abort) {
         fade_out(tail, tail_n);
         esp_audio_play(tail, tail_n * (int)sizeof(int16_t), portMAX_DELAY);
         total_bytes += tail_n * (int)sizeof(int16_t);
     }
     free(tail);
-    esp_audio_flush();
+    if (!s_tts_abort) {
+        esp_audio_flush();
+    }
     esp_tts_stream_reset(s_tts);
+
+    if (s_tts_abort) {
+        ESP_LOGW(TAG, "stopped for higher-priority WS audio");
+        return ESP_FAIL;
+    }
 
     ESP_LOGI(TAG, "played %d bytes (%d ms): %s",
              total_bytes, total_bytes / 32, text);
@@ -112,7 +127,9 @@ static void tts_task(void *arg)
     tts_job_t job;
     for (;;) {
         if (xQueueReceive(s_queue, &job, portMAX_DELAY) == pdTRUE) {
+            s_tts_busy = true;
             s_result = tts_speak(job.text);
+            s_tts_busy = false;
             xSemaphoreGive(s_done);
         }
     }
@@ -169,6 +186,7 @@ esp_err_t tts_play(const char *text)
     if (!tts_ready()) return ESP_ERR_INVALID_STATE;
     if (text == NULL || text[0] == '\0') return ESP_ERR_INVALID_ARG;
 
+    s_tts_abort = false;
     tts_job_t job;
     memset(&job, 0, sizeof(job));
     snprintf(job.text, sizeof(job.text), "%s", text);
@@ -177,8 +195,22 @@ esp_err_t tts_play(const char *text)
         return ESP_FAIL;
     }
     if (xSemaphoreTake(s_done, pdMS_TO_TICKS(30000)) != pdTRUE) {
+        s_tts_abort = true;
         ESP_LOGW(TAG, "play timeout");
         return ESP_ERR_TIMEOUT;
     }
     return s_result;
+}
+
+void tts_abort(void)
+{
+    if (!tts_ready()) {
+        return;
+    }
+    s_tts_abort = true;
+}
+
+bool tts_busy(void)
+{
+    return s_tts_busy;
 }

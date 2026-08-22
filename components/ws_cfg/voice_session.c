@@ -47,9 +47,13 @@
 #define AFE_FEED_MAX         2048
 
 #define RING_BLOCK_SIZE      1024
-#define RING_N_BLOCKS        80      /* ~80KB，容纳云端约 50–80KB PCM */
+#define RING_N_BLOCKS        150     /* 150KB = 4.8s @ 16kHz PCM */ 
 #define UP_RING_BLOCKS       16
-#define PLAY_DRAIN_MAX_MS    8000
+#define PLAY_HZ              16000
+#define PLAY_PREBUF_MS       1000
+#define PLAY_PREBUF_BYTES    ((PLAY_HZ * 2 * PLAY_PREBUF_MS) / 1000)
+#define PLAY_CHUNK           (RING_BLOCK_SIZE * 2)
+#define PLAY_DRAIN_MAX_MS    12000
 
 #define VAD_RMS_THRESHOLD    300
 #define VAD_HANGOVER         32
@@ -107,6 +111,15 @@ static char s_pending_tts[768];
 static volatile bool s_push_pending = false;
 static SemaphoreHandle_t s_push_mux = NULL;
 static ws_cfg_push_done_cb_t s_push_done_cb = NULL;
+static volatile bool s_play_run = false;
+
+static void play_enable(bool on)
+{
+    s_play_run = on;
+    if (!on && s_ring) {
+        rb_unblock_reader(s_ring);
+    }
+}
 
 /* ================================================================ */
 /*  AFE                                                             */
@@ -290,6 +303,7 @@ static void afe_fetch_task(void *arg)
                 res->wakeup_state == WAKENET_DETECTED &&
                 s_state == SESS_IDLE) {
                 ESP_LOGI(TAG, "!!! Wake word detected (AFE) !!!");
+                tts_abort();
                 if (s_evt) xEventGroupSetBits(s_evt, SESS_EVT_WAKE);
             }
         } else if (pipe == AFE_PIPE_VC && s_afe_vc && s_afe_vc_data) {
@@ -333,21 +347,9 @@ static void play_local_tts_fallback(const char *text, bool *ok)
     afe_resume(AFE_PIPE_WAKE);
 }
 
-static bool msgid_is_valid(const char *id)
+static bool ws_preferred(void)
 {
-    if (id == NULL || id[0] == '\0') {
-        return false;
-    }
-    if (strcmp(id, "string") == 0 || strcmp(id, "null") == 0 ||
-        strcmp(id, "undefined") == 0) {
-        return false;
-    }
-    for (const char *p = id; *p; p++) {
-        if (*p != ' ' && *p != '\t') {
-            return true;
-        }
-    }
-    return false;
+    return ws_cfg_has_push_uri() || ws_cfg_has_uri();
 }
 
 static void push_promote_pending(void)
@@ -386,6 +388,7 @@ static void session_teardown(bool normal)
 
     if (normal) {
         rb_done_write(s_ring);
+        play_enable(true);
         ESP_LOGI(TAG, "Draining playback");
         TickType_t t0 = xTaskGetTickCount();
         while (s_ring && rb_bytes_filled(s_ring) > 0 &&
@@ -393,8 +396,9 @@ static void session_teardown(bool normal)
             vTaskDelay(pdMS_TO_TICKS(20));
         }
         vTaskDelay(pdMS_TO_TICKS(80));
+        play_enable(false);
     } else {
-        rb_unblock_reader(s_ring);
+        play_enable(false);
         ESP_LOGW(TAG, "Abort playback");
     }
     ws_cfg_disconnect();
@@ -406,7 +410,14 @@ static void session_teardown(bool normal)
     ESP_LOGI(TAG, "Session teardown -> IDLE");
 
     bool ok = normal;
-    if (was_push && !normal) {
+    bool skip_local_tts = false;
+    if (s_push_mux) xSemaphoreTake(s_push_mux, portMAX_DELAY);
+    if (s_push_pending && ws_preferred()) {
+        skip_local_tts = true;
+    }
+    if (s_push_mux) xSemaphoreGive(s_push_mux);
+    /* 云端已经出声：不再叠本地 TTS。无音频才兜底。 */
+    if (was_push && !normal && !skip_local_tts && !ws_cfg_pcm_had_audio()) {
         play_local_tts_fallback(tts, &ok);
     }
     if (was_push && msgid[0] && s_push_done_cb) {
@@ -420,6 +431,8 @@ static void session_teardown(bool normal)
 
 static void start_cloud_session(TickType_t *t_connect_start, bool push)
 {
+    tts_abort();
+    play_enable(false);
     if (s_push_mux) xSemaphoreTake(s_push_mux, portMAX_DELAY);
     s_push_active = push;
     if (s_push_mux) xSemaphoreGive(s_push_mux);
@@ -464,7 +477,12 @@ esp_err_t ws_cfg_request_push(const char *msg_id, const char *tts_text)
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (s_push_mux) xSemaphoreTake(s_push_mux, portMAX_DELAY);
+    tts_abort();
+    play_enable(false);
+    xEventGroupClearBits(s_evt,
+        WS_EVT_CONNECTED | WS_EVT_DISCONNECTED |
+        WS_EVT_TTS_DONE | WS_EVT_TTS_ERROR |
+        SESS_EVT_WAKE | SESS_EVT_VAD_END);
     bool busy = s_push_active ||
                 (s_evt && (xEventGroupGetBits(s_evt) & SESS_EVT_PUSH));
     if (busy) {
@@ -496,13 +514,28 @@ esp_err_t ws_cfg_request_push(const char *msg_id, const char *tts_text)
 static void player_task(void *arg)
 {
     (void)arg;
-    char buf[RING_BLOCK_SIZE];
+    char buf[PLAY_CHUNK];
+    bool underrun_logged = false;
     for (;;) {
-        int n = rb_read(s_ring, buf, sizeof(buf), portMAX_DELAY);
-        if (n <= 0) {
-            rb_reset(s_ring);
+        if (!s_play_run) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            underrun_logged = false;
             continue;
         }
+        /* 等环形缓冲，不灌静音；I2S DMA auto_clear 会自己出零 */
+        int n = rb_read(s_ring, buf, sizeof(buf), pdMS_TO_TICKS(250));
+        if (n <= 0) {
+            if (!s_play_run) {
+                rb_reset(s_ring);
+                continue;
+            }
+            if (!underrun_logged) {
+                ESP_LOGW(TAG, "Play wait for more PCM");
+                underrun_logged = true;
+            }
+            continue;
+        }
+        underrun_logged = false;
         esp_audio_play((int16_t *)buf, n, portMAX_DELAY);
     }
 }
@@ -594,22 +627,29 @@ static void session_task(void *arg)
         case SESS_IDLE:
             if (xEventGroupGetBits(s_evt) & SESS_EVT_PUSH) {
                 xEventGroupClearBits(s_evt, SESS_EVT_PUSH);
-                bool use_cloud = msgid_is_valid(s_push_msgid) &&
-                                 (ws_cfg_has_push_uri() || ws_cfg_has_uri());
+                bool use_cloud = ws_preferred();
                 if (!use_cloud) {
-                    ESP_LOGW(TAG, "msgId invalid or no WS, local TTS (msgId=%s)",
+                    ESP_LOGW(TAG, "No WS uri, local TTS (msgId=%s)",
                              s_push_msgid[0] ? s_push_msgid : "-");
+                    if (s_push_mux) xSemaphoreTake(s_push_mux, portMAX_DELAY);
+                    s_push_active = true;
+                    if (s_push_mux) xSemaphoreGive(s_push_mux);
                     bool ok = false;
                     play_local_tts_fallback(s_push_tts, &ok);
-                    if (s_push_msgid[0] && s_push_done_cb) {
-                        s_push_done_cb(s_push_msgid, ok);
-                    }
+                    char msgid[sizeof(s_push_msgid)];
+                    snprintf(msgid, sizeof(msgid), "%s", s_push_msgid);
+                    if (s_push_mux) xSemaphoreTake(s_push_mux, portMAX_DELAY);
                     s_push_active = false;
                     s_push_msgid[0] = '\0';
                     s_push_tts[0] = '\0';
+                    push_promote_pending();
+                    if (s_push_mux) xSemaphoreGive(s_push_mux);
+                    if (msgid[0] && s_push_done_cb) {
+                        s_push_done_cb(msgid, ok);
+                    }
                     break;
                 }
-                ESP_LOGI(TAG, "Cloud push: connect WS (msgId=%s)",
+                ESP_LOGI(TAG, "Cloud push (WS first): connect WS (msgId=%s)",
                          s_push_msgid[0] ? s_push_msgid : "-");
                 start_cloud_session(&t_connect_start, true);
                 break;
@@ -748,11 +788,34 @@ stream_end:
 
         case SESS_WAIT_TTS: {
             EventBits_t bits = xEventGroupGetBits(s_evt);
-            if (rb_bytes_filled(s_ring) > 0) {
-                ESP_LOGI(TAG, "TTS audio arrived, playing");
+            int filled = rb_bytes_filled(s_ring);
+            bool ended = (bits & WS_EVT_TTS_DONE) != 0;
+            int expect = ws_cfg_pcm_expected_play_bytes();
+            int ring_cap = s_ring ? rb_get_size(s_ring) : 0;
+            bool hold_all = (expect > 0 && expect + 4096 < ring_cap);
+            bool ready = ended && filled > 0;
+            if (!hold_all) {
+                ready = ready || (filled >= PLAY_PREBUF_BYTES);
+            }
+            if (ready) {
+                ESP_LOGI(TAG, "TTS play start (buf=%d expect=%d%s)",
+                         filled, expect, ended ? ", complete" : ", prebuf");
+                play_enable(true);
                 t_play_start = xTaskGetTickCount();
                 s_state = SESS_PLAYING;
-            } else if (bits & WS_EVT_TTS_DONE) {
+                if (ended) {
+                    xEventGroupClearBits(s_evt, WS_EVT_TTS_DONE);
+                    if (!ws_cfg_pcm_complete()) {
+                        ESP_LOGW(TAG, "PCM incomplete, local TTS fallback");
+                        session_teardown(false);
+                    } else {
+                        ESP_LOGI(TAG, "TTS done, draining");
+                        session_teardown(true);
+                    }
+                }
+                break;
+            }
+            if (bits & WS_EVT_TTS_DONE) {
                 xEventGroupClearBits(s_evt, WS_EVT_TTS_DONE);
                 ESP_LOGI(TAG, "done without audio");
                 session_teardown(false);
@@ -763,7 +826,7 @@ stream_end:
                 xEventGroupClearBits(s_evt, WS_EVT_DISCONNECTED);
                 session_teardown(false);
             } else if (xTaskGetTickCount() - t_wait_start >
-                       pdMS_TO_TICKS(s_push_active ? 15000 : WAIT_TTS_TIMEOUT_MS)) {
+                       pdMS_TO_TICKS(s_push_active ? 25000 : WAIT_TTS_TIMEOUT_MS)) {
                 ESP_LOGW(TAG, "TTS timeout");
                 session_teardown(false);
             }
@@ -890,6 +953,8 @@ esp_err_t ws_cfg_init(void)
 {
     if (s_evt == NULL) s_evt = xEventGroupCreate();
     if (s_ring == NULL) s_ring = rb_create(RING_BLOCK_SIZE, RING_N_BLOCKS);
+    ESP_LOGI(TAG, "Play cache %d KB, prebuf %d ms",
+             RING_N_BLOCKS * RING_BLOCK_SIZE / 1024, PLAY_PREBUF_MS);
     if (s_up_ring == NULL) s_up_ring = rb_create(RING_BLOCK_SIZE, UP_RING_BLOCKS);
     if (s_afe_mux == NULL) s_afe_mux = xSemaphoreCreateMutex();
     if (s_play_mux == NULL) s_play_mux = xSemaphoreCreateMutex();
@@ -956,7 +1021,7 @@ esp_err_t ws_cfg_init(void)
 
     xTaskCreatePinnedToCore(session_task, "session_task", 8192, NULL, 5, NULL, 0);
     xTaskCreatePinnedToCore(afe_fetch_task, "afe_fetch", 4096, NULL, 4, NULL, 1);
-    xTaskCreatePinnedToCore(player_task, "player_task", 4096, NULL, 4, NULL, 1);
+    xTaskCreatePinnedToCore(player_task, "player_task", 6144, NULL, 6, NULL, 1);
     ESP_LOGI(TAG, "Voice session initialized (device=%s afe_wake=%d afe_vc=%d tts=%d)",
              s_device, s_afe_wake != NULL, s_afe_vc != NULL, tts_ready());
     return ESP_OK;

@@ -24,14 +24,14 @@
 #define TAG "WS_CFG"
 
 #define WS_URI_MAX          256
-#define WS_BUFFER_SIZE      2048   /* > 1024B PCM 帧 + JSON 帧，避免分片 */
+#define WS_BUFFER_SIZE      4096   /* 对齐云端 4096B PCM 帧 */
 #define WS_NET_TIMEOUT_MS   20000
 #define WS_TASK_STACK       8192
 #define WS_SEND_TIMEOUT_MS  100
 #define PLAY_HZ             16000
 #define RS_OUT_MAX          4096
 #define RS_IN_MAX           8
-#define PCM_WRITE_WAIT_MS   1000
+#define PCM_WRITE_WAIT_MS   2000
 
 static esp_websocket_client_handle_t s_client = NULL;
 static char s_uri_dialog[WS_URI_MAX] = {0};
@@ -441,4 +441,18 @@ bool ws_cfg_pcm_complete(void)
     int slack = s_header_bytes / 50;
     if (slack < 64) slack = 64;
     return (s_pcm_bytes_in + slack) >= s_header_bytes;
+}
+
+bool ws_cfg_pcm_had_audio(void)
+{
+    return s_pcm_bytes_in > 0 || s_pcm_bytes_out > 0;
+}
+
+int ws_cfg_pcm_expected_play_bytes(void)
+{
+    if (s_header_bytes <= 0) {
+        return 0;
+    }
+    int hz = (s_src_hz > 0) ? s_src_hz : PLAY_HZ;
+    return (int)((int64_t)s_header_bytes * PLAY_HZ / hz);
 }

@@ -47,6 +47,12 @@ esp_err_t ws_cfg_send_pcm(const uint8_t *data, int len);
  */
 bool ws_cfg_pcm_complete(void);
 
+/** @brief 本次会话是否已收到/写出过云端 PCM（有则不再叠本地 TTS） */
+bool ws_cfg_pcm_had_audio(void);
+
+/** @brief 按 header.bytes 估算重采样后 16 kHz 播放字节数；未知则 0 */
+int ws_cfg_pcm_expected_play_bytes(void);
+
 #ifdef __cplusplus
 }
 #endif

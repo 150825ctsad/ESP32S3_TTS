@@ -98,6 +98,7 @@ static audio_codec_data_if_t *rec_data_if = NULL;
 static audio_codec_if_t      *rec_codec_if = NULL;
 static esp_codec_dev_handle_t rec_dev = NULL;
 static SemaphoreHandle_t s_play_lock = NULL;
+static int s_out_vol = PLAYER_VOLUME;
 
 /* ------------------------------------------------------------------ */
 /*  I2S init (TX + RX 全双工，共用 BCLK/WS)                            */
@@ -115,15 +116,11 @@ static esp_err_t bsp_i2s_init(i2s_port_t i2s_num, uint32_t sample_rate,
     i2s_slot_mode_t slot_mode = I2S_SLOT_MODE_STEREO;
     int slot_bits = 32;   /* 统一 32-bit slot，兼容 24-bit 麦克风和 16-bit 功放 */
 
-    /* DMA 缓冲 8 x 480 帧 = 3840 帧 ≈ 240ms @16kHz */
-    i2s_chan_config_t chan_cfg = {
-        .id            = i2s_num,
-        .role          = I2S_ROLE_MASTER,
-        .dma_desc_num  = 8,
-        .dma_frame_num = 480,
-        .auto_clear    = true,
-    };
-    /* 同时创建 TX 和 RX 通道（全双工） */
+    /* GDMA：6 描述符 × 240 帧 ≈ 90ms @16kHz；欠载自动清零，避免重复最后一帧 */
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(i2s_num, I2S_ROLE_MASTER);
+    chan_cfg.dma_desc_num = 6;
+    chan_cfg.dma_frame_num = 240;
+    chan_cfg.auto_clear_after_cb = true;
     ret_val |= i2s_new_channel(&chan_cfg, &tx_handle, &rx_handle);
 
     /* TX: 32-bit slot，数据位宽 16-bit（高 16 位有效） */
@@ -166,6 +163,12 @@ static esp_err_t bsp_i2s_init(i2s_port_t i2s_num, uint32_t sample_rate,
 
     if (ret_val != ESP_OK) {
         ESP_LOGE(TAG, "I2S init failed");
+    } else {
+        ESP_LOGI(TAG, "I2S GDMA TX/RX desc=%u frame=%u (~%u ms @%lu Hz)",
+                 (unsigned)chan_cfg.dma_desc_num,
+                 (unsigned)chan_cfg.dma_frame_num,
+                 (unsigned)(chan_cfg.dma_desc_num * chan_cfg.dma_frame_num * 1000 / sample_rate),
+                 (unsigned long)sample_rate);
     }
     return ret_val;
 }
@@ -373,15 +376,15 @@ esp_err_t bsp_board_init(uint32_t sample_rate, int channel_format, int bits_per_
 
 esp_err_t bsp_audio_play(const int16_t *data, int length, TickType_t ticks_to_wait)
 {
-    (void)ticks_to_wait;
-    if (play_dev == NULL || data == NULL || length <= 0) {
+    if (tx_handle == NULL || data == NULL || length <= 0) {
         return ESP_FAIL;
     }
 
+    TickType_t wait = ticks_to_wait ? ticks_to_wait : portMAX_DELAY;
     if (s_play_lock) xSemaphoreTake(s_play_lock, portMAX_DELAY);
 
-    /* 禁止就地改写调用方缓冲：welcome.wav 在 flash mmap，写入会 Cache error 重启 */
-    static int16_t scratch[512];
+    /* DRAM 对齐块，GDMA 直接搬走；禁止改 flash mmap 的 welcome.wav */
+    static int16_t scratch[1024] __attribute__((aligned(8)));
     const uint8_t *src = (const uint8_t *)data;
     int remaining = length;
     esp_err_t ret = ESP_OK;
@@ -391,8 +394,19 @@ esp_err_t bsp_audio_play(const int16_t *data, int length, TickType_t ticks_to_wa
 #if AUDIO_PREPROCESS_EN
         audio_preprocess(scratch, n / (int)sizeof(int16_t));
 #endif
-        ret = esp_codec_dev_write(play_dev, scratch, n);
+        int ns = n / (int)sizeof(int16_t);
+        int vol = s_out_vol;
+        if (vol < 0) vol = 0;
+        if (vol > 100) vol = 100;
+        if (vol != 100) {
+            for (int i = 0; i < ns; i++) {
+                scratch[i] = (int16_t)(((int32_t)scratch[i] * vol) / 100);
+            }
+        }
+        size_t written = 0;
+        ret = i2s_channel_write(tx_handle, scratch, (size_t)n, &written, wait);
         if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "I2S DMA write fail %s", esp_err_to_name(ret));
             break;
         }
         src += n;
@@ -404,14 +418,20 @@ esp_err_t bsp_audio_play(const int16_t *data, int length, TickType_t ticks_to_wa
 
 esp_err_t bsp_audio_set_play_vol(int volume)
 {
-    if (play_dev == NULL) return ESP_FAIL;
-    return esp_codec_dev_set_out_vol(play_dev, volume);
+    if (volume < 0) volume = 0;
+    if (volume > 100) volume = 100;
+    s_out_vol = volume;
+    if (play_dev) {
+        esp_codec_dev_set_out_vol(play_dev, volume);
+    }
+    return ESP_OK;
 }
 
 esp_err_t bsp_audio_get_play_vol(int *volume)
 {
-    if (play_dev == NULL) return ESP_FAIL;
-    return esp_codec_dev_get_out_vol(play_dev, volume);
+    if (volume == NULL) return ESP_FAIL;
+    *volume = s_out_vol;
+    return ESP_OK;
 }
 
 /* 静音长度须 ≥ DMA 缓冲总时长(240ms)，才能保证残留语音全部流出到喇叭 */
@@ -424,7 +444,11 @@ esp_err_t bsp_audio_flush(void)
      * const 数组位于 flash 映射区，写入会触发 Cache error panic */
     static int16_t silence[FLUSH_SILENCE_SAMPLES];   /* .bss 零初始化 */
     if (s_play_lock) xSemaphoreTake(s_play_lock, portMAX_DELAY);
-    esp_err_t ret = esp_codec_dev_write(play_dev, (void *)silence, sizeof(silence));
+    size_t written = 0;
+    esp_err_t ret = ESP_FAIL;
+    if (tx_handle) {
+        ret = i2s_channel_write(tx_handle, silence, sizeof(silence), &written, portMAX_DELAY);
+    }
     if (s_play_lock) xSemaphoreGive(s_play_lock);
     return ret;
 }

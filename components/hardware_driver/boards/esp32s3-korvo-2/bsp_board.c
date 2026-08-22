@@ -236,13 +236,24 @@ static esp_err_t bsp_i2s_init(i2s_port_t i2s_num, uint32_t sample_rate, int chan
         bits_per_chan = 32;
     }
 
+    /* GDMA：6 描述符 × 240 帧 ≈ 90ms @16kHz；欠载自动清零 */
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(i2s_num, I2S_ROLE_MASTER);
+    chan_cfg.dma_desc_num = 6;
+    chan_cfg.dma_frame_num = 240;
+    chan_cfg.auto_clear_after_cb = true;
     ret_val |= i2s_new_channel(&chan_cfg, &tx_handle, &rx_handle);
     i2s_std_config_t std_cfg = I2S_CONFIG_DEFAULT(sample_rate, channel_fmt, bits_per_chan);
     ret_val |= i2s_channel_init_std_mode(tx_handle, &std_cfg);
     ret_val |= i2s_channel_init_std_mode(rx_handle, &std_cfg);
     ret_val |= i2s_channel_enable(tx_handle);
     ret_val |= i2s_channel_enable(rx_handle);
+    if (ret_val == ESP_OK) {
+        ESP_LOGI(TAG, "I2S DMA desc=%u frame=%u (~%u ms @%u Hz stereo)",
+                 (unsigned)chan_cfg.dma_desc_num,
+                 (unsigned)chan_cfg.dma_frame_num,
+                 (unsigned)(chan_cfg.dma_desc_num * chan_cfg.dma_frame_num * 1000 / sample_rate),
+                 (unsigned)sample_rate);
+    }
 #else
     i2s_channel_fmt_t channel_fmt = I2S_CHANNEL_FMT_RIGHT_LEFT;
     if (channel_format == 1) {
@@ -324,19 +335,26 @@ esp_err_t bsp_audio_play(const int16_t* data, int length, TickType_t ticks_to_wa
         return ESP_FAIL;
     }
 
-    /* 应用层是 16-bit 单声道；I2S/ES8311 是 16-bit 立体声，复制到 L/R */
-    int n = length / (int)sizeof(int16_t);
-    int16_t *st = (int16_t *)malloc((size_t)n * 2 * sizeof(int16_t));
-    if (st == NULL) {
-        return ESP_ERR_NO_MEM;
+    /* 静态 DRAM，GDMA 可直接搬；避免每次 malloc 打断 DMA 连续出流 */
+    enum { STEREO_MAX = 1024 };
+    static int16_t stereo[STEREO_MAX * 2] __attribute__((aligned(8)));
+
+    int remain = length / (int)sizeof(int16_t);
+    const int16_t *src = data;
+    while (remain > 0) {
+        int n = remain > STEREO_MAX ? STEREO_MAX : remain;
+        for (int i = 0; i < n; i++) {
+            stereo[2 * i] = src[i];
+            stereo[2 * i + 1] = src[i];
+        }
+        esp_err_t ret = esp_codec_dev_write(play_dev, stereo, n * 2 * (int)sizeof(int16_t));
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        src += n;
+        remain -= n;
     }
-    for (int i = 0; i < n; i++) {
-        st[2 * i] = data[i];
-        st[2 * i + 1] = data[i];
-    }
-    esp_err_t ret = esp_codec_dev_write(play_dev, st, n * 2 * (int)sizeof(int16_t));
-    free(st);
-    return ret;
+    return ESP_OK;
 }
 
 esp_err_t bsp_get_feed_data(bool is_get_raw_channel, int16_t *buffer, int buffer_len)
@@ -572,3 +590,4 @@ esp_err_t bsp_sdcard_deinit(char *mount_point)
 
     return ret_val;
 }
+

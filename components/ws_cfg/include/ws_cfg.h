@@ -32,8 +32,8 @@ bool ws_cfg_has_push_uri(void);
  * @brief 云端下发 ws 后立刻发起一次 TTS 播放会话（不走麦克风上行）
  *
  * 播完后通过 ws_cfg_set_push_done_cb 回调 msgId。
- * msgId 无效（空、"string" 等）或云端 PCM 不完整时，改用本地 TTS 播 tts 文本。
- * 若当前正在语音会话中，会等到回到 IDLE 再处理。
+ * 有 WebSocket 地址时优先走云端 PCM；无地址、或云端失败且未播出音频时，
+ * 用本地 TTS 播 tts 文本。本地 TTS 播放中若到来云端语音或唤醒，会被打断。
  */
 esp_err_t ws_cfg_request_push(const char *msg_id, const char *tts_text);
 
