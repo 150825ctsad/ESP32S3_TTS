@@ -28,4 +28,6 @@ esp_err_t battery_get(bool *charging, int *percent);
  */
 esp_err_t battery_get_state(bool *charging, bool *full, int *percent);
 
+void battery_task(void *arg);
+
 #endif

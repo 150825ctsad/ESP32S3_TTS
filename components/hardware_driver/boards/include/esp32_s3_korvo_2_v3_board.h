@@ -29,8 +29,8 @@
 #define FUNC_I2C_EN     (1)
 #define I2C_NUM         (0)
 #define I2C_CLK         (600000)
-#define GPIO_I2C_SCL    (GPIO_NUM_18)
-#define GPIO_I2C_SDA    (GPIO_NUM_17)
+#define GPIO_I2C_SCL    (GPIO_NUM_11)
+#define GPIO_I2C_SDA    (GPIO_NUM_12)
 
 /**
  * @brief ESP32-S3-KORVO-2-V3.0 SDMMC GPIO defination
@@ -63,11 +63,11 @@
  * 
  */
 #define FUNC_I2S_EN         (1)
-#define GPIO_I2S_LRCK       (GPIO_NUM_45)
-#define GPIO_I2S_MCLK       (GPIO_NUM_16)
-#define GPIO_I2S_SCLK       (GPIO_NUM_9)
-#define GPIO_I2S_SDIN       (GPIO_NUM_10)
-#define GPIO_I2S_DOUT       (GPIO_NUM_8)
+#define GPIO_I2S_LRCK       (GPIO_NUM_46)
+#define GPIO_I2S_MCLK       (GPIO_NUM_19)
+#define GPIO_I2S_SCLK       (GPIO_NUM_20)
+#define GPIO_I2S_SDIN       (GPIO_NUM_3)
+#define GPIO_I2S_DOUT       (GPIO_NUM_9)
 
 /**
  * @brief ESP32-S3-KORVO-2-V3.0 I2S GPIO defination

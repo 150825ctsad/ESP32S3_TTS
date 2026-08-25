@@ -17,10 +17,10 @@
 #define BLINK_MS 400
 
 #ifndef GPIO_LED_RED
-#define GPIO_LED_RED     GPIO_NUM_NC
+#define GPIO_LED_RED     GPIO_NUM_6
 #endif
 #ifndef GPIO_LED_GREEN
-#define GPIO_LED_GREEN   GPIO_NUM_NC
+#define GPIO_LED_GREEN   GPIO_NUM_7
 #endif
 #ifndef LED_ACTIVE_LEVEL
 #define LED_ACTIVE_LEVEL 1

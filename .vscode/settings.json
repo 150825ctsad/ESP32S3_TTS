@@ -4,7 +4,7 @@
   "idf.openOcdConfigs": [
     "board/esp32s3-builtin.cfg"
   ],
-  "idf.currentSetup": "D:/Espressif/frameworks/esp-idf-v5.5.4/",
+  "idf.currentSetup": "D:\\.espressif\\v5.5.5\\esp-idf",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
   },
@@ -14,7 +14,7 @@
     "--query-driver=**",
     "--compile-commands-dir=${workspaceFolder}/build"
   ],
-  "idf.portWin": "COM13",
+  "idf.portWin": "COM4",
   "idf.flashType": "UART",
   "idf.flashBaudRate": "921600"
 }

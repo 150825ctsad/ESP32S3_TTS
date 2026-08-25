@@ -375,7 +375,7 @@ void mqtt_task(void *pvParameters)
         if (mqtt_connected) {
             publish_wifi_info();
         }
-        vTaskDelay(pdMS_TO_TICKS(20000));
+        vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
 
