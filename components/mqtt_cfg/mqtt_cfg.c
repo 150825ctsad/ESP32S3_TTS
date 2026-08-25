@@ -28,6 +28,7 @@
 #include "freertos/task.h"
 #include "esp_board_init.h"
 #include "ws_cfg.h"
+#include "battery.h"
 #include "cJSON.h"
 
 #define TAG                    "MQTT_CLIENT"
@@ -100,7 +101,7 @@ static void publish_wifi_info(void)
 
     bool charging = false;
     int battery = -1;
-    esp_battery_get(&charging, &battery);
+    battery_get(&charging, &battery);
 
     char json[320];
     int len = snprintf(json, sizeof(json),

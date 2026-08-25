@@ -10,4 +10,5 @@ idf_component_register( SRCS
                         ws_cfg
                         sr_ringbuf
                         hardware_driver
-                        led_status)
+                        led_status
+                        battery)

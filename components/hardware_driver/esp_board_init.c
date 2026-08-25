@@ -112,18 +112,6 @@ esp_err_t esp_audio_get_play_vol(int *volume)
     return bsp_audio_get_play_vol(volume);
 }
 
-esp_err_t __attribute__((weak)) bsp_battery_get(bool *charging, int *percent)
-{
-    if (charging) *charging = false;
-    if (percent) *percent = -1;
-    return ESP_ERR_NOT_SUPPORTED;
-}
-
-esp_err_t esp_battery_get(bool *charging, int *percent)
-{
-    return bsp_battery_get(charging, percent);
-}
-
 esp_err_t FatfsComboWrite(const void* buffer, int size, int count, FILE* stream)
 {
     esp_err_t res = ESP_OK;

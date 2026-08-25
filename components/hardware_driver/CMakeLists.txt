@@ -43,7 +43,6 @@ idf_component_register(
         spiffs
         esp_codec_dev
         esp_driver_i2c
-        esp_adc
         )
 
 component_compile_options(-w)

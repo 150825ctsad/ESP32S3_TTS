@@ -151,14 +151,6 @@ esp_err_t bsp_audio_set_play_vol(int volume);
  */
 esp_err_t bsp_audio_get_play_vol(int *volume);
 
-/**
- * @brief 读取充电状态与电量百分比
- *
- * @param charging  非 NULL 时写入：true=充电中
- * @param percent   非 NULL 时写入：0~100，读不到则为 -1
- */
-esp_err_t bsp_battery_get(bool *charging, int *percent);
-
 
 #ifdef __cplusplus
 }

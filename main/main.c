@@ -13,11 +13,13 @@
 #include "button.h"
 #include "ws_cfg.h"
 #include "led_status.h"
+#include "battery.h"
 
 int app_main()
 {
     led_status_init();
     ESP_ERROR_CHECK(esp_board_init(16000, 1, 16));
+    battery_init();
 
     button_init();
     /* 语音会话：麦克风 + WakeNet「你好小易」+ 上行组帧，唤醒后播「在」再开 WS */
