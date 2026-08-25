@@ -17,6 +17,9 @@
 #ifndef GPIO_CHARGE_DET
 #define GPIO_CHARGE_DET         GPIO_NUM_2
 #endif
+#ifndef GPIO_STDBY_DET
+#define GPIO_STDBY_DET          GPIO_NUM_NC
+#endif
 #ifndef CHARGE_ACTIVE_LEVEL
 #define CHARGE_ACTIVE_LEVEL     0
 #endif
@@ -45,6 +48,16 @@ esp_err_t battery_init(void)
         gpio_config_t io = {
             .mode         = GPIO_MODE_INPUT,
             .pin_bit_mask = 1ULL << GPIO_CHARGE_DET,
+            .pull_up_en   = GPIO_PULLUP_ENABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type    = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&io);
+    }
+    if (GPIO_STDBY_DET != GPIO_NUM_NC) {
+        gpio_config_t io = {
+            .mode         = GPIO_MODE_INPUT,
+            .pin_bit_mask = 1ULL << GPIO_STDBY_DET,
             .pull_up_en   = GPIO_PULLUP_ENABLE,
             .pull_down_en = GPIO_PULLDOWN_DISABLE,
             .intr_type    = GPIO_INTR_DISABLE,
@@ -94,15 +107,17 @@ esp_err_t battery_init(void)
     }
 
     s_inited = true;
-    ESP_LOGI(TAG, "init ADC GPIO%d charge GPIO%d divider=%.1f",
-             (int)GPIO_BATTERY_ADC, (int)GPIO_CHARGE_DET, (double)BATTERY_DIVIDER);
+    ESP_LOGI(TAG, "init ADC GPIO%d chrg GPIO%d stdby GPIO%d divider=%.1f",
+             (int)GPIO_BATTERY_ADC, (int)GPIO_CHARGE_DET, (int)GPIO_STDBY_DET,
+             (double)BATTERY_DIVIDER);
     return ESP_OK;
 }
 
-esp_err_t battery_get(bool *charging, int *percent)
+esp_err_t battery_get_state(bool *charging, bool *full, int *percent)
 {
     if (!s_inited) {
         if (charging) *charging = false;
+        if (full) *full = false;
         if (percent) *percent = -1;
         return ESP_ERR_INVALID_STATE;
     }
@@ -113,6 +128,14 @@ esp_err_t battery_get(bool *charging, int *percent)
     }
     if (charging) {
         *charging = chg;
+    }
+
+    bool f = false;
+    if (GPIO_STDBY_DET != GPIO_NUM_NC) {
+        f = (gpio_get_level(GPIO_STDBY_DET) == CHARGE_ACTIVE_LEVEL);
+    }
+    if (full) {
+        *full = f;
     }
 
     int pct = -1;
@@ -148,4 +171,9 @@ esp_err_t battery_get(bool *charging, int *percent)
         *percent = pct;
     }
     return ESP_OK;
+}
+
+esp_err_t battery_get(bool *charging, int *percent)
+{
+    return battery_get_state(charging, NULL, percent);
 }

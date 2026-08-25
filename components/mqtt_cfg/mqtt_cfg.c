@@ -100,12 +100,13 @@ static void publish_wifi_info(void)
     esp_audio_get_play_vol(&vol);
 
     bool charging = false;
+    bool full = false;
     int battery = -1;
-    battery_get(&charging, &battery);
+    battery_get_state(&charging, &full, &battery);
 
     char json[320];
     int len = snprintf(json, sizeof(json),
-        "{\"device\":\"%s\",\"rssi\":%d,\"ip\":\"" IPSTR "\",\"ssid\":\"%s\",\"uptime\":%lu,\"vol\":%d,\"charging\":%d,\"battery\":%d}",
+        "{\"device\":\"%s\",\"rssi\":%d,\"ip\":\"" IPSTR "\",\"ssid\":\"%s\",\"uptime\":%lu,\"vol\":%d,\"charging\":%d,\"full\":%d,\"battery\":%d}",
         mqtt_client_id,
         (int)rssi,
         IP2STR(&ip_info.ip),
@@ -113,6 +114,7 @@ static void publish_wifi_info(void)
         (unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS / 1000),
         vol,
         charging ? 1 : 0,
+        full ? 1 : 0,
         battery);
 
     if (len > 0 && len < sizeof(json)) {

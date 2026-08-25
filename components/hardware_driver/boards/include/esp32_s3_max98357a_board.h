@@ -94,10 +94,12 @@
  * @brief 电池与充电检测
  *
  * GPIO1：ADC 采电池分压（默认 2:1，Vbat = Vadc×2）
- * GPIO2：充电状态（TP4056 CHRG 一类，低电平=充电中）
+ * GPIO2：TP4056 CHRG（低电平=充电中）
+ * GPIO3：TP4056 STDBY（低电平=已充满）
  */
 #define GPIO_BATTERY_ADC        (GPIO_NUM_1)
 #define GPIO_CHARGE_DET         (GPIO_NUM_2)
+#define GPIO_STDBY_DET          (GPIO_NUM_3)
 #define CHARGE_ACTIVE_LEVEL     (0)
 #define BATTERY_DIVIDER         (2.0f)
 #define BATTERY_EMPTY_MV        (3300)
