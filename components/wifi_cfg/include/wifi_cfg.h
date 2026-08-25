@@ -16,4 +16,7 @@ void wifi_init(void);
 /** @brief SoftAP 配网页是否正在运行 */
 bool wifi_is_provisioning(void);
 
+/** @brief STA 是否已拿到 IP / 已关联 AP */
+bool wifi_is_connected(void);
+
 #endif /* __WIFI_H */

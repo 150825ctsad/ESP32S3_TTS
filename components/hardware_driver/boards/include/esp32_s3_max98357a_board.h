@@ -78,7 +78,7 @@
 /**
  * @brief Default playback volume (0-100)
  */
-#define PLAYER_VOLUME   (75)
+#define PLAYER_VOLUME   (30)
 
 /**
  * @brief PA power control via MAX98357A SD_MODE pin
@@ -89,6 +89,32 @@
 #define FUNC_PWR_CTRL       (0)
 #define GPIO_PWR_CTRL       (GPIO_NUM_NC)
 #define GPIO_PWR_ON_LEVEL   (1)
+
+/**
+ * @brief 电池与充电检测
+ *
+ * GPIO1：ADC 采电池分压（默认 2:1，Vbat = Vadc×2）
+ * GPIO2：充电状态（TP4056 CHRG 一类，低电平=充电中）
+ */
+#define GPIO_BATTERY_ADC        (GPIO_NUM_1)
+#define GPIO_CHARGE_DET         (GPIO_NUM_2)
+#define CHARGE_ACTIVE_LEVEL     (0)
+#define BATTERY_DIVIDER         (2.0f)
+#define BATTERY_EMPTY_MV        (3300)
+#define BATTERY_FULL_MV         (4200)
+
+/**
+ * @brief 红/绿双色指示灯（共阴高电平亮；共阳则把 LED_ACTIVE_LEVEL 改为 0）
+ *
+ * 红绿闪：启动中
+ * 红常亮：未联网
+ * 红闪：等待配网
+ * 绿常亮：WiFi + 云服务正常
+ * 绿闪：WiFi 正常但云服务异常
+ */
+#define GPIO_LED_RED            (GPIO_NUM_6)
+#define GPIO_LED_GREEN          (GPIO_NUM_7)
+#define LED_ACTIVE_LEVEL        (1)
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
 

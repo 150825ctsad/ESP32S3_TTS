@@ -20,17 +20,16 @@
 #include "sdmmc_cmd.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
 
 #define ADC_I2S_CHANNEL 0
 
 /* ------------------------------------------------------------------ */
-/*  音频预处理：EQ + 数字增益 + 软限幅                                 */
-/*  - 200Hz 高通：削减低频嗡声，保护小喇叭                             */
-/*  - 3kHz 峰化 +6dB：提升人声音频段(1~4kHz)清晰度                     */
-/*  - 数字增益 +4dB，软限幅防止削波破音                                */
+/*  音频预处理：200Hz 高通 + 软限幅（不做数字增益 / 3kHz 峰化）        */
 /* ------------------------------------------------------------------ */
 #define AUDIO_PREPROCESS_EN   1
-#define AUDIO_PRE_GAIN        1.6f     /* ≈ +4.1dB */
 
 typedef struct {
     float b0, b1, b2, a1, a2;   /* 归一化系数 (RBJ cookbook) */
@@ -40,10 +39,6 @@ typedef struct {
 static biquad_t s_hpf = {  /* 高通 200Hz, Q=0.707, fs=16kHz */
     .b0 = 0.94597556f, .b1 = -1.89195112f, .b2 = 0.94597556f,
     .a1 = -1.88903308f, .a2 = 0.89487432f,
-};
-static biquad_t s_peq = {  /* 峰化 3kHz, +6dB, Q=0.707, fs=16kHz */
-    .b0 = 1.31476723f, .b1 = -0.52333896f, .b2 = 0.05275853f,
-    .a1 = -0.52333896f, .a2 = 0.36753022f,
 };
 
 static inline float biquad_process(biquad_t *s, float x)
@@ -72,10 +67,7 @@ static inline int16_t soft_clip(int32_t x)
 static void audio_preprocess(int16_t *pcm, int n)
 {
     for (int i = 0; i < n; i++) {
-        float x = (float)pcm[i];
-        x = biquad_process(&s_hpf, x);
-        x = biquad_process(&s_peq, x);
-        x *= AUDIO_PRE_GAIN;
+        float x = biquad_process(&s_hpf, (float)pcm[i]);
         pcm[i] = soft_clip((int32_t)x);
     }
 }
@@ -99,6 +91,10 @@ static audio_codec_if_t      *rec_codec_if = NULL;
 static esp_codec_dev_handle_t rec_dev = NULL;
 static SemaphoreHandle_t s_play_lock = NULL;
 static int s_out_vol = PLAYER_VOLUME;
+
+static adc_oneshot_unit_handle_t s_adc = NULL;
+static adc_cali_handle_t s_adc_cali = NULL;
+static adc_channel_t s_adc_ch;
 
 /* ------------------------------------------------------------------ */
 /*  I2S init (TX + RX 全双工，共用 BCLK/WS)                            */
@@ -342,6 +338,110 @@ static esp_err_t bsp_codec_adc_deinit(void)
     return ESP_OK;
 }
 
+static esp_err_t bsp_battery_init(void)
+{
+    if (GPIO_CHARGE_DET != GPIO_NUM_NC) {
+        gpio_config_t io = {
+            .mode         = GPIO_MODE_INPUT,
+            .pin_bit_mask = 1ULL << GPIO_CHARGE_DET,
+            .pull_up_en   = GPIO_PULLUP_ENABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type    = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&io);
+    }
+
+    if (GPIO_BATTERY_ADC == GPIO_NUM_NC) {
+        return ESP_OK;
+    }
+
+    adc_unit_t unit = ADC_UNIT_1;
+    esp_err_t err = adc_oneshot_io_to_channel(GPIO_BATTERY_ADC, &unit, &s_adc_ch);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "GPIO%d is not an ADC pin", (int)GPIO_BATTERY_ADC);
+        return err;
+    }
+
+    adc_oneshot_unit_init_cfg_t ucfg = {
+        .unit_id = unit,
+    };
+    err = adc_oneshot_new_unit(&ucfg, &s_adc);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "ADC unit init failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    adc_oneshot_chan_cfg_t ccfg = {
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+        .atten    = ADC_ATTEN_DB_12,
+    };
+    err = adc_oneshot_config_channel(s_adc, s_adc_ch, &ccfg);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "ADC channel config failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+    adc_cali_curve_fitting_config_t cali_cfg = {
+        .unit_id  = unit,
+        .chan     = s_adc_ch,
+        .atten    = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    if (adc_cali_create_scheme_curve_fitting(&cali_cfg, &s_adc_cali) != ESP_OK) {
+        s_adc_cali = NULL;
+    }
+#endif
+    ESP_LOGI(TAG, "Battery ADC GPIO%d, charge GPIO%d",
+             (int)GPIO_BATTERY_ADC, (int)GPIO_CHARGE_DET);
+    return ESP_OK;
+}
+
+esp_err_t bsp_battery_get(bool *charging, int *percent)
+{
+    bool chg = false;
+    if (GPIO_CHARGE_DET != GPIO_NUM_NC) {
+        chg = (gpio_get_level(GPIO_CHARGE_DET) == CHARGE_ACTIVE_LEVEL);
+    }
+    if (charging) {
+        *charging = chg;
+    }
+
+    int pct = -1;
+    if (s_adc) {
+        int raw = 0;
+        int sum = 0;
+        int n = 0;
+        for (int i = 0; i < 8; i++) {
+            if (adc_oneshot_read(s_adc, s_adc_ch, &raw) == ESP_OK) {
+                sum += raw;
+                n++;
+            }
+        }
+        if (n > 0) {
+            raw = sum / n;
+            int mv = 0;
+            if (s_adc_cali == NULL ||
+                adc_cali_raw_to_voltage(s_adc_cali, raw, &mv) != ESP_OK) {
+                mv = raw * 3300 / 4095;
+            }
+            int vbat = (int)((float)mv * BATTERY_DIVIDER);
+            if (vbat <= BATTERY_EMPTY_MV) {
+                pct = 0;
+            } else if (vbat >= BATTERY_FULL_MV) {
+                pct = 100;
+            } else {
+                pct = (vbat - BATTERY_EMPTY_MV) * 100 /
+                      (BATTERY_FULL_MV - BATTERY_EMPTY_MV);
+            }
+        }
+    }
+    if (percent) {
+        *percent = pct;
+    }
+    return ESP_OK;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Public API                                                        */
 /* ------------------------------------------------------------------ */
@@ -370,6 +470,8 @@ esp_err_t bsp_board_init(uint32_t sample_rate, int channel_format, int bits_per_
         /* 录音失败不影响播放 */
     }
 
+    bsp_battery_init();
+
     ESP_LOGI(TAG, "Board init done");
     return ESP_OK;
 }
@@ -394,6 +496,7 @@ esp_err_t bsp_audio_play(const int16_t *data, int length, TickType_t ticks_to_wa
 #if AUDIO_PREPROCESS_EN
         audio_preprocess(scratch, n / (int)sizeof(int16_t));
 #endif
+        /* 用户音量：MAX98357A 无模拟增益，只能在此缩放；100 为原幅度 */
         int ns = n / (int)sizeof(int16_t);
         int vol = s_out_vol;
         if (vol < 0) vol = 0;

@@ -2,14 +2,17 @@
  *
  * 主题设计：
  *   cmd/<mac>    下行指令（设备订阅 QoS1）：{"vol":50} / {"ws":"/ws/..."}
- *   status/<mac>   上行环境数据（设备发布 QoS0）：WiFi 信息 RSSI/IP/SSID/uptime/vol
+ *   status/<mac> 上行环境数据（设备发布 QoS0）：WiFi / 音量 / 充电 / 电量
+ *   reply/<mac>  上行播完回执（设备发布 QoS1）
+ *                成功 {"msgid":"...","result":"ok","tts":"ok","text":"..."}
+ *                失败 {"msgid":"...","result":"fail","error":"语音失败"}
  *   online       上线通知（通用主题，QoS2，retained，消息体含 device 字段）
  *
  * 业务流程：
  *   1. 连接后立即上报设备ID（QoS2, retained）
  *   2. 周期上报 WiFi 信息（环境数据）
- *   3. 下发 {"vol":50} → 设置音量 → 返回 {"vol":"ok","value":50}
- *   4. 下发含 /ws/ 路径字段 → 保存地址并立刻连 WS 播 TTS，播完返回 {"msgId":"..."}
+ *   3. 下发 {"vol":50} → 设置音量 → reply/<mac> {"result":"ok","vol":50}
+ *   4. 下发 TTS → 播完 reply/<mac> 成功/失败 JSON
  ******************************************************************************/
 #include <stdio.h>
 #include <string.h>
@@ -38,13 +41,19 @@
 static char mqtt_client_id[13] = "000000000000";
 
 /* 设备专属主题 */
-static char mqtt_topic_cmd[24];        /* "cmd/b81f3fb86280"   下行指令 */
-static char mqtt_topic_data[24];      /* "status/b81f3fb86280"  上行环境数据 */
+static char mqtt_topic_cmd[24];        /* "cmd/<mac>"    下行指令 */
+static char mqtt_topic_data[24];       /* "status/<mac>" 上行环境数据 */
+static char mqtt_topic_reply[24];      /* "reply/<mac>"  播完回执 */
 /* online 为通用主题，所有设备共用，消息体中携带 device 字段区分 */
 #define MQTT_TOPIC_ONLINE  "online"
 
 static esp_mqtt_client_handle_t mqtt_client = NULL;
 static volatile bool mqtt_connected = false;
+
+bool mqtt_is_connected(void)
+{
+    return mqtt_connected;
+}
 
 /* ================================================================ */
 /*  上行：发布函数                                                   */
@@ -89,15 +98,21 @@ static void publish_wifi_info(void)
     int vol = 0;
     esp_audio_get_play_vol(&vol);
 
-    char json[256];
+    bool charging = false;
+    int battery = -1;
+    esp_battery_get(&charging, &battery);
+
+    char json[320];
     int len = snprintf(json, sizeof(json),
-        "{\"device\":\"%s\",\"rssi\":%d,\"ip\":\"" IPSTR "\",\"ssid\":\"%s\",\"uptime\":%lu,\"vol\":%d}",
+        "{\"device\":\"%s\",\"rssi\":%d,\"ip\":\"" IPSTR "\",\"ssid\":\"%s\",\"uptime\":%lu,\"vol\":%d,\"charging\":%d,\"battery\":%d}",
         mqtt_client_id,
         (int)rssi,
         IP2STR(&ip_info.ip),
         ssid,
         (unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS / 1000),
-        vol);
+        vol,
+        charging ? 1 : 0,
+        battery);
 
     if (len > 0 && len < sizeof(json)) {
         int msg_id = esp_mqtt_client_publish(mqtt_client, mqtt_topic_data, json, len, 0, 0);
@@ -109,22 +124,35 @@ static void publish_wifi_info(void)
     }
 }
 
-/* 云端 TTS 播完 → 把下发的 msgId 回传 */
-static void on_push_tts_done(const char *msg_id, bool ok)
+/* 云端 TTS 播完 → reply/<mac> */
+static int s_cmd_vol = -1;
+
+static void on_push_tts_done(const char *msg_id, bool ok, const char *text)
 {
     if (!mqtt_connected || mqtt_client == NULL || msg_id == NULL || !msg_id[0]) {
         return;
     }
     cJSON *root = cJSON_CreateObject();
     if (root == NULL) return;
-    cJSON_AddStringToObject(root, "msgId", msg_id);
-    cJSON_AddStringToObject(root, "tts", ok ? "ok" : "fail");
+    cJSON_AddStringToObject(root, "msgid", msg_id);
+    if (ok) {
+        cJSON_AddStringToObject(root, "result", "ok");
+        cJSON_AddStringToObject(root, "tts", "ok");
+        cJSON_AddStringToObject(root, "text", text ? text : "");
+        if (s_cmd_vol >= 0) {
+            cJSON_AddNumberToObject(root, "vol", s_cmd_vol);
+        }
+    } else {
+        cJSON_AddStringToObject(root, "result", "fail");
+        cJSON_AddStringToObject(root, "error", "语音失败");
+    }
+    s_cmd_vol = -1;
     char *js = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (js == NULL) return;
     int len = (int)strlen(js);
-    esp_mqtt_client_publish(mqtt_client, mqtt_topic_data, js, len, 1, 0);
-    ESP_LOGI(TAG, "Push done ack: %s", js);
+    esp_mqtt_client_publish(mqtt_client, mqtt_topic_reply, js, len, 1, 0);
+    ESP_LOGI(TAG, "Push done ack %s: %s", mqtt_topic_reply, js);
     cJSON_free(js);
 }
 
@@ -141,6 +169,7 @@ static void handle_command(const char *msg_str)
     }
 
     /* 1. 音量控制  */
+    s_cmd_vol = -1;
     cJSON *vol = cJSON_GetObjectItemCaseSensitive(root, "vol");
     int v = -1;
     if (cJSON_IsNumber(vol)) {
@@ -151,13 +180,8 @@ static void handle_command(const char *msg_str)
     if (v >= 0) {
         if (v > 100) v = 100;
         esp_audio_set_play_vol(v);
+        s_cmd_vol = v;
         ESP_LOGI(TAG, "Volume set: %d", v);
-        /* 返回确认 */
-        char json[64];
-        int len = snprintf(json, sizeof(json), "{\"vol\":\"ok\",\"value\":%d}", v);
-        if (len > 0 && len < sizeof(json)) {
-            esp_mqtt_client_publish(mqtt_client, mqtt_topic_data, json, len, 1, 0);
-        }
     }
 
     /* 含 /ws/ 路径：保存地址并立刻连 WS 播放，完成后回传 msgId */
@@ -187,6 +211,23 @@ static void handle_command(const char *msg_str)
     }
     if (got_ws || (tts_text && tts_text[0])) {
         ws_cfg_request_push(msgid, tts_text);
+    } else if (v >= 0) {
+        cJSON *ack = cJSON_CreateObject();
+        if (ack) {
+            if (msgid && msgid[0]) {
+                cJSON_AddStringToObject(ack, "msgid", msgid);
+            }
+            cJSON_AddStringToObject(ack, "result", "ok");
+            cJSON_AddNumberToObject(ack, "vol", v);
+            char *js = cJSON_PrintUnformatted(ack);
+            cJSON_Delete(ack);
+            if (js) {
+                esp_mqtt_client_publish(mqtt_client, mqtt_topic_reply, js, (int)strlen(js), 1, 0);
+                ESP_LOGI(TAG, "Ctrl ack %s: %s", mqtt_topic_reply, js);
+                cJSON_free(js);
+            }
+        }
+        s_cmd_vol = -1;
     }
 
     cJSON_Delete(root);
@@ -316,10 +357,11 @@ void mqtt_task(void *pvParameters)
                  "%02x%02x%02x%02x%02x%02x",
                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     }
-    snprintf(mqtt_topic_cmd,    sizeof(mqtt_topic_cmd),    "cmd/%s",    mqtt_client_id);
-    snprintf(mqtt_topic_data,   sizeof(mqtt_topic_data),   "status/%s",   mqtt_client_id);
-    ESP_LOGI(TAG, "Client ID: %s | cmd: %s | status: %s | online: %s",
-             mqtt_client_id, mqtt_topic_cmd, mqtt_topic_data, MQTT_TOPIC_ONLINE);
+    snprintf(mqtt_topic_cmd,   sizeof(mqtt_topic_cmd),   "cmd/%s",    mqtt_client_id);
+    snprintf(mqtt_topic_data,  sizeof(mqtt_topic_data),  "status/%s", mqtt_client_id);
+    snprintf(mqtt_topic_reply, sizeof(mqtt_topic_reply), "reply/%s",  mqtt_client_id);
+    ESP_LOGI(TAG, "Client ID: %s | cmd: %s | status: %s | reply: %s | online: %s",
+             mqtt_client_id, mqtt_topic_cmd, mqtt_topic_data, mqtt_topic_reply, MQTT_TOPIC_ONLINE);
 
     /* 等待网络连接 */
     vTaskDelay(pdMS_TO_TICKS(20000));

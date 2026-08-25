@@ -9,4 +9,5 @@ idf_component_register( SRCS
                         wifi_cfg
                         ws_cfg
                         sr_ringbuf
-                        hardware_driver)
+                        hardware_driver
+                        led_status)

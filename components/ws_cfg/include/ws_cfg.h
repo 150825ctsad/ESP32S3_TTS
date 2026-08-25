@@ -31,13 +31,13 @@ bool ws_cfg_has_push_uri(void);
 /**
  * @brief 云端下发 ws 后立刻发起一次 TTS 播放会话（不走麦克风上行）
  *
- * 播完后通过 ws_cfg_set_push_done_cb 回调 msgId。
+ * 播完后通过 ws_cfg_set_push_done_cb 回调 msgid、结果和原文。
  * 有 WebSocket 地址时优先走云端 PCM；无地址、或云端失败且未播出音频时，
  * 用本地 TTS 播 tts 文本。本地 TTS 播放中若到来云端语音或唤醒，会被打断。
  */
 esp_err_t ws_cfg_request_push(const char *msg_id, const char *tts_text);
 
-typedef void (*ws_cfg_push_done_cb_t)(const char *msg_id, bool ok);
+typedef void (*ws_cfg_push_done_cb_t)(const char *msg_id, bool ok, const char *text);
 void ws_cfg_set_push_done_cb(ws_cfg_push_done_cb_t cb);
 
 /**

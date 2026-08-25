@@ -421,7 +421,7 @@ static void session_teardown(bool normal)
         play_local_tts_fallback(tts, &ok);
     }
     if (was_push && msgid[0] && s_push_done_cb) {
-        s_push_done_cb(msgid, ok);
+        s_push_done_cb(msgid, ok, tts);
     }
 
     if (s_push_mux) xSemaphoreTake(s_push_mux, portMAX_DELAY);
@@ -458,6 +458,22 @@ static void start_cloud_session(TickType_t *t_connect_start, bool push)
             ws_cfg_play_tone();
         }
     }
+}
+
+static void on_wake_word(TickType_t *t_connect_start)
+{
+    ESP_LOGI(TAG, "Wake word: ack then dialog WS");
+    afe_pause();
+    if (tts_ready()) {
+        tts_play("在");
+    }
+    if (!ws_cfg_has_uri()) {
+        ESP_LOGW(TAG, "No dialog ws uri yet, tone and ignore");
+        afe_resume(AFE_PIPE_WAKE);
+        ws_cfg_play_tone();
+        return;
+    }
+    start_cloud_session(t_connect_start, false);
 }
 
 void ws_cfg_set_push_done_cb(ws_cfg_push_done_cb_t cb)
@@ -637,7 +653,9 @@ static void session_task(void *arg)
                     bool ok = false;
                     play_local_tts_fallback(s_push_tts, &ok);
                     char msgid[sizeof(s_push_msgid)];
+                    char tts[sizeof(s_push_tts)];
                     snprintf(msgid, sizeof(msgid), "%s", s_push_msgid);
+                    snprintf(tts, sizeof(tts), "%s", s_push_tts);
                     if (s_push_mux) xSemaphoreTake(s_push_mux, portMAX_DELAY);
                     s_push_active = false;
                     s_push_msgid[0] = '\0';
@@ -645,7 +663,7 @@ static void session_task(void *arg)
                     push_promote_pending();
                     if (s_push_mux) xSemaphoreGive(s_push_mux);
                     if (msgid[0] && s_push_done_cb) {
-                        s_push_done_cb(msgid, ok);
+                        s_push_done_cb(msgid, ok, tts);
                     }
                     break;
                 }
@@ -657,12 +675,7 @@ static void session_task(void *arg)
             if (use_afe_wake) {
                 if (xEventGroupGetBits(s_evt) & SESS_EVT_WAKE) {
                     xEventGroupClearBits(s_evt, SESS_EVT_WAKE);
-                    if (!ws_cfg_has_uri()) {
-                        ESP_LOGW(TAG, "No dialog ws uri yet, tone and ignore");
-                        ws_cfg_play_tone();
-                        break;
-                    }
-                    start_cloud_session(&t_connect_start, false);
+                    on_wake_word(&t_connect_start);
                 }
             } else if (s_wn && s_wn_data) {
                 for (int i = 0; i < nsamp && wn_n < (int)(sizeof(wn_buf) / sizeof(wn_buf[0])); i++) {
@@ -678,12 +691,7 @@ static void session_task(void *arg)
                     if (st == WAKENET_DETECTED) {
                         ESP_LOGI(TAG, "!!! Wake word detected (raw WN) !!!");
                         wn_n = 0;
-                        if (!ws_cfg_has_uri()) {
-                            ESP_LOGW(TAG, "No dialog ws uri yet, tone and ignore");
-                            ws_cfg_play_tone();
-                            break;
-                        }
-                        start_cloud_session(&t_connect_start, false);
+                        on_wake_word(&t_connect_start);
                     }
                 }
             }
