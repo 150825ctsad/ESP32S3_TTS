@@ -161,8 +161,8 @@ esp_err_t battery_get_state(bool *charging, bool *full, int *percent)
                 mv = raw * 3300 / 2048;
             }
             int vbat = (int)((float)mv * BATTERY_DIVIDER);
-            ESP_LOGI(TAG, "ADC raw=%d mv=%d vbat=%d mV charging=%d full=%d",
-                     raw, mv, vbat, chg ? 1 : 0, f ? 1 : 0);
+            // ESP_LOGI(TAG, "ADC raw=%d mv=%d vbat=%d mV charging=%d full=%d",
+            //          raw, mv, vbat, chg ? 1 : 0, f ? 1 : 0);
             if (vbat <= BATTERY_EMPTY_MV) {
                 pct = 0;
             } else if (vbat >= BATTERY_FULL_MV) {
@@ -198,14 +198,15 @@ void battery_task(void *arg)
         int battery = -1;
 
         esp_err_t err = battery_get_state(&charging, &full, &battery);
-        if (err == ESP_OK) {
-            ESP_LOGI(TAG, "Battery: charging=%s, percent=%d%%, full=%s",
-                     charging ? "true" : "false",
-                     battery,
-                     full ? "true" : "false");
-        } else {
-            ESP_LOGW(TAG, "Battery read failed: %s", esp_err_to_name(err));
-        }
+
+        // if (err == ESP_OK) {
+        //     ESP_LOGI(TAG, "Battery: charging=%s, percent=%d%%, full=%s",
+        //              charging ? "true" : "false",
+        //              battery,
+        //              full ? "true" : "false");
+        // } else {
+        //     ESP_LOGW(TAG, "Battery read failed: %s", esp_err_to_name(err));
+        // }
 
         vTaskDelay(pdMS_TO_TICKS(1000));
     }

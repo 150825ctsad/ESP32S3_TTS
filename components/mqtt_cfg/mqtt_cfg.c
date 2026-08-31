@@ -17,12 +17,15 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
+#include <sys/time.h>
 #include "mqtt_cfg.h"
 #include "mqtt_client.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
+#include "esp_sntp.h"
 #include "lwip/ip4_addr.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -50,6 +53,47 @@ static char mqtt_topic_reply[24];      /* "reply/<mac>"  播完回执 */
 
 static esp_mqtt_client_handle_t mqtt_client = NULL;
 static volatile bool mqtt_connected = false;
+
+static void mqtt_sync_rtc_time(void)
+{
+    static bool s_time_init = false;
+    if (s_time_init) {
+        return;
+    }
+    s_time_init = true;
+
+    setenv("TZ", "CST-8", 1);
+    tzset();
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_init();
+    ESP_LOGI(TAG, "SNTP initialized for RTC time sync (Beijing time, UTC+8)");
+}
+
+static long mqtt_report_time_sec(void)
+{
+    time_t now = 0;
+    time(&now);
+    if (now > 1000000000L) {
+        return (long)now;
+    }
+    return (long)(xTaskGetTickCount() * portTICK_PERIOD_MS / 1000);
+}
+
+static void mqtt_report_local_time(char *buf, size_t buf_size)
+{
+    time_t now = 0;
+    time(&now);
+    struct tm tm_now;
+    localtime_r(&now, &tm_now);
+    snprintf(buf, buf_size, "%04d-%02d-%02d %02d:%02d:%02d",
+             tm_now.tm_year + 1900,
+             tm_now.tm_mon + 1,
+             tm_now.tm_mday,
+             tm_now.tm_hour,
+             tm_now.tm_min,
+             tm_now.tm_sec);
+}
 
 bool mqtt_is_connected(void)
 {
@@ -104,13 +148,18 @@ static void publish_wifi_info(void)
     int battery = -1;
     battery_get_state(&charging, &full, &battery);
 
-    char json[320];
+    long ts = mqtt_report_time_sec();
+    char local_time[64] = {0};
+    mqtt_report_local_time(local_time, sizeof(local_time));
+    char json[512];
     int len = snprintf(json, sizeof(json),
-        "{\"device\":\"%s\",\"rssi\":%d,\"ip\":\"" IPSTR "\",\"ssid\":\"%s\",\"uptime\":%lu,\"vol\":%d,\"charging\":%d,\"full\":%d,\"battery\":%d}",
+        "{\"device\":\"%s\",\"rssi\":%d,\"ip\":\"" IPSTR "\",\"ssid\":\"%s\",\"time\":%ld,\"local_time\":\"%s\",\"uptime\":%lu,\"vol\":%d,\"charging\":%d,\"full\":%d,\"battery\":%d}",
         mqtt_client_id,
         (int)rssi,
         IP2STR(&ip_info.ip),
         ssid,
+        ts,
+        local_time,
         (unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS / 1000),
         vol,
         charging ? 1 : 0,
@@ -251,6 +300,7 @@ static void mqtt_event_callback(void *handler_args,
     case MQTT_EVENT_CONNECTED:
         esp_mqtt_client_subscribe_single(mqtt_client, mqtt_topic_cmd, 1);
         mqtt_connected = true;
+        mqtt_sync_rtc_time();
         ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED, subscribed: %s", mqtt_topic_cmd);
         /* 连接后立即上报设备ID（QoS2, retained） */
         publish_device_online();
