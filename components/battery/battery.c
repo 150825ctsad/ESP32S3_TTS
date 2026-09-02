@@ -2,43 +2,114 @@
  * battery.c  -- 充电状态 + 电量百分比（GPIO 检测 + ADC 分压）
  ******************************************************************************/
 #include "battery.h"
-#include "bsp_board.h"
 #include "driver/gpio.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
+#include "hal/adc_ll.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 #define TAG "BATTERY"
 
-#ifndef GPIO_BATTERY_ADC
-#define GPIO_BATTERY_ADC        GPIO_NUM_17
-#endif
-#ifndef GPIO_CHARGE_DET
-#define GPIO_CHARGE_DET         GPIO_NUM_16
-#endif
-#ifndef GPIO_STDBY_DET
-#define GPIO_STDBY_DET          GPIO_NUM_15
-#endif
-#ifndef CHARGE_ACTIVE_LEVEL
-#define CHARGE_ACTIVE_LEVEL     0
-#endif
-#ifndef BATTERY_DIVIDER
-#define BATTERY_DIVIDER         2.0f
-#endif
-#ifndef BATTERY_EMPTY_MV
-#define BATTERY_EMPTY_MV        3300
-#endif
-#ifndef BATTERY_FULL_MV
-#define BATTERY_FULL_MV         4200
-#endif
+/* 分压后 ADC 低于此值视为没接电池（开路），不要报 0% */
+#define VBAT_OPEN_MV            2500
+#define ADC_WARMUP              4
+#define ADC_SAMPLES             12
 
 static adc_oneshot_unit_handle_t s_adc = NULL;
 static adc_cali_handle_t s_adc_cali = NULL;
 static adc_channel_t s_adc_ch;
 static bool s_inited = false;
+static int s_pct = -1;
+static int s_vbat_mv = -1;
+
+static bool gpio_active(gpio_num_t pin)
+{
+    if (pin == GPIO_NUM_NC) {
+        return false;
+    }
+    return gpio_get_level(pin) == CHARGE_ACTIVE_LEVEL;
+}
+
+static int raw_to_pin_mv(int raw)
+{
+    int mv = 0;
+    if (s_adc_cali != NULL &&
+        adc_cali_raw_to_voltage(s_adc_cali, raw, &mv) == ESP_OK) {
+        return mv;
+    }
+    /* ESP32-S3 默认 12bit，12dB 约 0–3300mV */
+    return raw * 3300 / 4095;
+}
+
+static int vbat_to_percent(int vbat)
+{
+    if (vbat < VBAT_OPEN_MV) {
+        return -1;
+    }
+    if (vbat <= BATTERY_EMPTY_MV) {
+        return 0;
+    }
+    if (vbat >= BATTERY_FULL_MV) {
+        return 100;
+    }
+    return (vbat - BATTERY_EMPTY_MV) * 100 /
+           (BATTERY_FULL_MV - BATTERY_EMPTY_MV);
+}
+
+static esp_err_t adc_read_retry(int *raw)
+{
+    for (int t = 0; t < 8; t++) {
+        if (adc_oneshot_read(s_adc, s_adc_ch, raw) == ESP_OK) {
+            return ESP_OK;
+        }
+        vTaskDelay(1);
+    }
+    return ESP_FAIL;
+}
+
+static void battery_sample_adc(void)
+{
+    if (s_adc == NULL) {
+        s_pct = -1;
+        s_vbat_mv = -1;
+        return;
+    }
+
+    int raw = 0;
+    int sum = 0;
+    int n = 0;
+    for (int i = 0; i < ADC_WARMUP; i++) {
+        (void)adc_read_retry(&raw);
+    }
+    for (int i = 0; i < ADC_SAMPLES; i++) {
+        if (adc_read_retry(&raw) == ESP_OK) {
+            sum += raw;
+            n++;
+        }
+    }
+    if (n <= 0) {
+        ESP_LOGW(TAG, "ADC read failed");
+        return;
+    }
+
+    raw = sum / n;
+    int pin_mv = raw_to_pin_mv(raw);
+    int vbat = (int)((float)pin_mv * BATTERY_DIVIDER + 0.5f);
+    int pct = vbat_to_percent(vbat);
+
+    /* 有效读数做一点平滑，避免上报乱跳 */
+    if (pct >= 0 && s_pct >= 0) {
+        pct = (s_pct * 3 + pct) / 4;
+    }
+
+    s_vbat_mv = vbat;
+    s_pct = pct;
+    // ESP_LOGI(TAG, "ADC raw=%d pin=%dmV vbat=%dmV pct=%d",
+    //          raw, pin_mv, vbat, pct);
+}
 
 esp_err_t battery_init(void)
 {
@@ -47,6 +118,7 @@ esp_err_t battery_init(void)
     }
 
     if (GPIO_CHARGE_DET != GPIO_NUM_NC) {
+        gpio_reset_pin(GPIO_CHARGE_DET);
         gpio_config_t io = {
             .mode         = GPIO_MODE_INPUT,
             .pin_bit_mask = 1ULL << GPIO_CHARGE_DET,
@@ -57,6 +129,7 @@ esp_err_t battery_init(void)
         gpio_config(&io);
     }
     if (GPIO_STDBY_DET != GPIO_NUM_NC) {
+        gpio_reset_pin(GPIO_STDBY_DET);
         gpio_config_t io = {
             .mode         = GPIO_MODE_INPUT,
             .pin_bit_mask = 1ULL << GPIO_STDBY_DET,
@@ -68,27 +141,37 @@ esp_err_t battery_init(void)
     }
 
     if (GPIO_BATTERY_ADC != GPIO_NUM_NC) {
+        /* 不要 gpio_reset_pin：会打开拉，100k 分压会被拉偏甚至采成 0。
+         * GPIO17 = ADC2_CH6。WiFi 占用 ADC2 时 oneshot 可能超时，采样里重试。 */
         adc_unit_t unit = ADC_UNIT_1;
-        esp_err_t err = adc_oneshot_io_to_channel(GPIO_BATTERY_ADC, &unit, &s_adc_ch);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "GPIO%d is not an ADC pin", (int)GPIO_BATTERY_ADC);
+        s_adc_ch = 0;
+        esp_err_t map_err = adc_oneshot_io_to_channel(GPIO_BATTERY_ADC, &unit, &s_adc_ch);
+        if (map_err != ESP_OK) {
+            ESP_LOGW(TAG, "GPIO%d is not an ADC pin: %s",
+                     (int)GPIO_BATTERY_ADC, esp_err_to_name(map_err));
+            s_adc = NULL;
         } else {
+
             adc_oneshot_unit_init_cfg_t ucfg = {
                 .unit_id = unit,
             };
-            err = adc_oneshot_new_unit(&ucfg, &s_adc);
+            esp_err_t err = adc_oneshot_new_unit(&ucfg, &s_adc);
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "ADC unit init failed: %s", esp_err_to_name(err));
                 s_adc = NULL;
             } else {
                 adc_oneshot_chan_cfg_t ccfg = {
-                    .bitwidth = ADC_BITWIDTH_DEFAULT,
+                    .bitwidth = ADC_BITWIDTH_12,
                     .atten    = ADC_ATTEN_DB_12,
                 };
                 err = adc_oneshot_config_channel(s_adc, s_adc_ch, &ccfg);
                 if (err != ESP_OK) {
                     ESP_LOGW(TAG, "ADC channel config failed: %s", esp_err_to_name(err));
+                    adc_oneshot_del_unit(s_adc);
                     s_adc = NULL;
+                } else {
+                    adc_ll_set_sample_cycle(255);
+                    vTaskDelay(pdMS_TO_TICKS(20));
                 }
             }
 
@@ -98,22 +181,24 @@ esp_err_t battery_init(void)
                     .unit_id  = unit,
                     .chan     = s_adc_ch,
                     .atten    = ADC_ATTEN_DB_12,
-                    .bitwidth = ADC_BITWIDTH_DEFAULT,
+                    .bitwidth = ADC_BITWIDTH_12,
                 };
                 if (adc_cali_create_scheme_curve_fitting(&cali_cfg, &s_adc_cali) != ESP_OK) {
                     s_adc_cali = NULL;
+                    ESP_LOGW(TAG, "ADC cali unavailable, use linear 12-bit");
                 }
             }
 #endif
+            ESP_LOGI(TAG, "init GPIO%d ADC%d_CH%d cali=%d divider=%.1f",
+                     (int)GPIO_BATTERY_ADC, (int)unit + 1, (int)s_adc_ch,
+                     s_adc_cali ? 1 : 0, (double)BATTERY_DIVIDER);
         }
     }
 
     s_inited = true;
-    ESP_LOGI(TAG, "init ADC GPIO%d chrg GPIO%d stdby GPIO%d divider=%.1f",
-             (int)GPIO_BATTERY_ADC, (int)GPIO_CHARGE_DET, (int)GPIO_STDBY_DET,
-             (double)BATTERY_DIVIDER);
+    battery_sample_adc();
 
-    xTaskCreatePinnedToCore(battery_task, "battery", 4 * 1024, NULL, 4, NULL, 0);
+    xTaskCreatePinnedToCore(battery_task, "battery", 3 * 1024, NULL, 4, NULL, 0);
     return ESP_OK;
 }
 
@@ -126,59 +211,14 @@ esp_err_t battery_get_state(bool *charging, bool *full, int *percent)
         return ESP_ERR_INVALID_STATE;
     }
 
-    bool chg = false;
-    if (GPIO_CHARGE_DET != GPIO_NUM_NC) {
-        chg = (gpio_get_level(GPIO_CHARGE_DET) == CHARGE_ACTIVE_LEVEL);
-    }
     if (charging) {
-        *charging = chg;
-    }
-
-    bool f = false;
-    if (GPIO_STDBY_DET != GPIO_NUM_NC) {
-        f = (gpio_get_level(GPIO_STDBY_DET) == CHARGE_ACTIVE_LEVEL);
+        *charging = gpio_active(GPIO_CHARGE_DET);
     }
     if (full) {
-        *full = f;
-    }
-
-    int pct = -1;
-    if (s_adc) {
-        int raw = 0;
-        int sum = 0;
-        int n = 0;
-        for (int i = 0; i < 8; i++) {
-            if (adc_oneshot_read(s_adc, s_adc_ch, &raw) == ESP_OK) {
-                sum += raw;
-                n++;
-            }
-        }
-        if (n > 0) {
-            raw = sum / n;
-            int mv = 0;
-            if (s_adc_cali == NULL ||
-                adc_cali_raw_to_voltage(s_adc_cali, raw, &mv) != ESP_OK) {
-                mv = raw * 3300 / 2048;
-            }
-            int vbat = (int)((float)mv * BATTERY_DIVIDER);
-            // ESP_LOGI(TAG, "ADC raw=%d mv=%d vbat=%d mV charging=%d full=%d",
-            //          raw, mv, vbat, chg ? 1 : 0, f ? 1 : 0);
-            if (vbat <= BATTERY_EMPTY_MV) {
-                pct = 0;
-            } else if (vbat >= BATTERY_FULL_MV) {
-                pct = 100;
-            } else {
-                pct = (vbat - BATTERY_EMPTY_MV) * 100 /
-                      (BATTERY_FULL_MV - BATTERY_EMPTY_MV);
-            }
-        } else {
-            ESP_LOGW(TAG, "ADC read failed: raw samples=0, charging=%d full=%d", chg ? 1 : 0, f ? 1 : 0);
-        }
-    } else {
-        ESP_LOGW(TAG, "ADC not initialized; charging=%d full=%d", chg ? 1 : 0, f ? 1 : 0);
+        *full = gpio_active(GPIO_STDBY_DET);
     }
     if (percent) {
-        *percent = pct;
+        *percent = s_pct;
     }
     return ESP_OK;
 }
@@ -188,26 +228,11 @@ esp_err_t battery_get(bool *charging, int *percent)
     return battery_get_state(charging, NULL, percent);
 }
 
-
 void battery_task(void *arg)
 {
-
-    while (1) {
-        bool charging = false;
-        bool full = false;
-        int battery = -1;
-
-        esp_err_t err = battery_get_state(&charging, &full, &battery);
-
-        // if (err == ESP_OK) {
-        //     ESP_LOGI(TAG, "Battery: charging=%s, percent=%d%%, full=%s",
-        //              charging ? "true" : "false",
-        //              battery,
-        //              full ? "true" : "false");
-        // } else {
-        //     ESP_LOGW(TAG, "Battery read failed: %s", esp_err_to_name(err));
-        // }
-
-        vTaskDelay(pdMS_TO_TICKS(1000));
+    (void)arg;
+    for (;;) {
+        battery_sample_adc();
+        vTaskDelay(pdMS_TO_TICKS(2000));
     }
 }

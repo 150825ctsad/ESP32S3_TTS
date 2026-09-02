@@ -90,32 +90,27 @@ static SemaphoreHandle_t s_play_lock = NULL;
 static int s_out_vol = PLAYER_VOLUME;
 
 /* ------------------------------------------------------------------ */
-/*  I2S init (TX + RX 全双工，共用 BCLK/WS)                            */
+/*  I2S0 全双工：TX/RX 必须同一份 std_cfg，IDF 才会共享 BCLK/WS        */
 /* ------------------------------------------------------------------ */
 
 static esp_err_t bsp_i2s_init(i2s_port_t i2s_num, uint32_t sample_rate,
                               int channel_format, int bits_per_chan)
 {
+    (void)channel_format;
+    (void)bits_per_chan;
     esp_err_t ret_val = ESP_OK;
 
-    /* TX 和 RX 共用同一个 I2S 控制器，BCLK/WS 自动同步。
-     * MSM261 要求 fSCK = 64 × fWS（每帧 64 BCLK），
-     * 用 32-bit STEREO slot：32×2 = 64 BCLK/帧，满足 MSM261 要求。
-     * MAX98357A 只取高 16 位，32-bit slot 也能正常工作。 */
-    i2s_slot_mode_t slot_mode = I2S_SLOT_MODE_STEREO;
-    int slot_bits = 32;   /* 统一 32-bit slot，兼容 24-bit 麦克风和 16-bit 功放 */
-
-    /* GDMA：6 描述符 × 240 帧 ≈ 90ms @16kHz；欠载自动清零，避免重复最后一帧 */
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(i2s_num, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num = 6;
+    chan_cfg.dma_desc_num = 8;
     chan_cfg.dma_frame_num = 240;
     chan_cfg.auto_clear_after_cb = true;
     ret_val |= i2s_new_channel(&chan_cfg, &tx_handle, &rx_handle);
 
-    /* TX: 32-bit slot，数据位宽 16-bit（高 16 位有效） */
-    i2s_std_config_t tx_cfg = {
+    /* 与官方 duplex 示例相同：TX/RX 传同一份配置。
+     * 32-bit slot × 2 = 64×fs；MSM261 L/R 接 GND = 只收左槽。 */
+    i2s_std_config_t std_cfg = {
         .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(slot_bits, slot_mode),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(32, I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
             .mclk = GPIO_I2S_MCLK,
             .bclk = GPIO_I2S_SCLK,
@@ -124,39 +119,20 @@ static esp_err_t bsp_i2s_init(i2s_port_t i2s_num, uint32_t sample_rate,
             .din  = GPIO_I2S_SDIN,
         },
     };
-    /* TX slot 数据位宽设为 16-bit（在 32-bit slot 中） */
-    tx_cfg.slot_cfg.data_bit_width = bits_per_chan;
-    tx_cfg.slot_cfg.slot_bit_width = slot_bits;
-    ret_val |= i2s_channel_init_std_mode(tx_handle, &tx_cfg);
+    std_cfg.slot_cfg.data_bit_width = I2S_DATA_BIT_WIDTH_16BIT;
+    std_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT;
+    std_cfg.slot_cfg.ws_width = 32;
+    std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
 
-    /* RX: 32-bit slot，数据位宽 24-bit（MSM261 输出 24-bit） */
-    i2s_std_config_t rx_cfg = {
-        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(slot_bits, slot_mode),
-        .gpio_cfg = {
-            .mclk = GPIO_I2S_MCLK,
-            .bclk = GPIO_I2S_SCLK,
-            .ws   = GPIO_I2S_LRCK,
-            .dout = GPIO_I2S_DOUT,
-            .din  = GPIO_I2S_SDIN,
-        },
-    };
-    rx_cfg.slot_cfg.data_bit_width = 24;
-    rx_cfg.slot_cfg.slot_bit_width = slot_bits;
-    /* MSM261 L/R 接 GND = 左声道，只收左 slot */
-    rx_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
-    ret_val |= i2s_channel_init_std_mode(rx_handle, &rx_cfg);
-
+    ret_val |= i2s_channel_init_std_mode(tx_handle, &std_cfg);
+    ret_val |= i2s_channel_init_std_mode(rx_handle, &std_cfg);
     ret_val |= i2s_channel_enable(tx_handle);
     ret_val |= i2s_channel_enable(rx_handle);
 
     if (ret_val != ESP_OK) {
         ESP_LOGE(TAG, "I2S init failed");
     } else {
-        ESP_LOGI(TAG, "I2S GDMA TX/RX desc=%u frame=%u (~%u ms @%lu Hz)",
-                 (unsigned)chan_cfg.dma_desc_num,
-                 (unsigned)chan_cfg.dma_frame_num,
-                 (unsigned)(chan_cfg.dma_desc_num * chan_cfg.dma_frame_num * 1000 / sample_rate),
+        ESP_LOGI(TAG, "I2S0 duplex 16bit/32slot LEFT @%lu Hz",
                  (unsigned long)sample_rate);
     }
     return ret_val;
@@ -222,17 +198,11 @@ static esp_err_t bsp_codec_dac_init(int sample_rate, int channel_format, int bit
         return ESP_FAIL;
     }
 
-    esp_codec_dev_sample_info_t fs = {
-        .bits_per_sample = bits_per_chan,
-        .sample_rate     = sample_rate,
-        .channel         = channel_format,
-    };
-    ret_val = esp_codec_dev_open(play_dev, &fs);
-    if (ret_val != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open output codec device");
-    }
-    esp_codec_dev_set_out_vol(play_dev, PLAYER_VOLUME);
-
+    /* 不要 esp_codec_dev_open：它会按 16-bit/单声道重配 I2S，
+     * 把 BCLK 打成 32×fs，MSM261 要求 64×fs，麦会一直输出 0。 */
+    (void)sample_rate;
+    (void)channel_format;
+    (void)bits_per_chan;
     return ret_val;
 }
 
@@ -260,57 +230,12 @@ static esp_err_t bsp_codec_dac_deinit(void)
 
 static esp_err_t bsp_codec_adc_init(int sample_rate, int channel_format, int bits_per_chan)
 {
-    esp_err_t ret_val = ESP_OK;
-
-    /* I2S data interface (RX）— 共用同一个 I2S 控制器 */
-    audio_codec_i2s_cfg_t i2s_cfg = {
-        .port = I2S_NUM_0,
-        .rx_handle = rx_handle,
-        .tx_handle = NULL,
-    };
-    rec_data_if = audio_codec_new_i2s_data(&i2s_cfg);
-    if (rec_data_if == NULL) {
-        ESP_LOGE(TAG, "Failed to create I2S data interface for ADC");
-        return ESP_FAIL;
-    }
-
-    /* Dummy codec（MSM261 无 I2C 控制，纯 I2S 直出） */
-    dummy_codec_cfg_t dummy_cfg = {
-        .gpio_if     = NULL,
-        .pa_pin      = -1,
-        .pa_reverted = false,
-    };
-    rec_codec_if = dummy_codec_new(&dummy_cfg);
-    if (rec_codec_if == NULL) {
-        ESP_LOGE(TAG, "Failed to create dummy codec for ADC");
-        return ESP_FAIL;
-    }
-
-    /* Input device */
-    esp_codec_dev_cfg_t dev_cfg = {
-        .codec_if = rec_codec_if,
-        .data_if  = rec_data_if,
-        .dev_type = ESP_CODEC_DEV_TYPE_IN,
-    };
-    rec_dev = esp_codec_dev_new(&dev_cfg);
-    if (rec_dev == NULL) {
-        ESP_LOGE(TAG, "Failed to create input codec device");
-        return ESP_FAIL;
-    }
-
-    /* MSM261: 24-bit 数据，左声道 */
-    esp_codec_dev_sample_info_t fs = {
-        .bits_per_sample = 24,
-        .sample_rate     = sample_rate,
-        .channel         = 1,
-    };
-    ret_val = esp_codec_dev_open(rec_dev, &fs);
-    if (ret_val != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open input codec device");
-    }
-    esp_codec_dev_set_in_gain(rec_dev, RECORD_VOLUME);
-
-    return ret_val;
+    /* 录音走 i2s_channel_read，不再挂 dummy codec。
+     * 打开 rec_dev 会重配 RX/TX，破坏 64×fs 和全双工时钟。 */
+    (void)sample_rate;
+    (void)channel_format;
+    (void)bits_per_chan;
+    return ESP_OK;
 }
 
 static esp_err_t bsp_codec_adc_deinit(void)
@@ -429,7 +354,7 @@ esp_err_t bsp_audio_get_play_vol(int *volume)
 
 esp_err_t bsp_audio_flush(void)
 {
-    if (play_dev == NULL) return ESP_FAIL;
+    if (tx_handle == NULL) return ESP_FAIL;
     /* 不能加 const：esp_codec_dev 软件音量会就地改写该缓冲，
      * const 数组位于 flash 映射区，写入会触发 Cache error panic */
     static int16_t silence[FLUSH_SILENCE_SAMPLES];   /* .bss 零初始化 */
@@ -448,8 +373,40 @@ esp_err_t bsp_audio_flush(void)
 esp_err_t bsp_get_feed_data(bool is_get_raw_channel, int16_t *buffer, int buffer_len)
 {
     (void)is_get_raw_channel;
-    if (rec_dev == NULL) return ESP_ERR_NOT_SUPPORTED;
-    return esp_codec_dev_read(rec_dev, (uint8_t *)buffer, buffer_len);
+    if (rx_handle == NULL || buffer == NULL || buffer_len <= 0) {
+        return ESP_FAIL;
+    }
+
+    int ns = buffer_len / (int)sizeof(int16_t);
+    if (ns <= 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    size_t want = (size_t)ns * sizeof(int16_t);
+    size_t nread = 0;
+    /* 最后一参是毫秒，不是 tick */
+    esp_err_t err = i2s_channel_read(rx_handle, buffer, want, &nread, 1000);
+    if (err != ESP_OK) {
+        static TickType_t t_rx_log;
+        TickType_t now = xTaskGetTickCount();
+        if (t_rx_log == 0 || (now - t_rx_log) >= pdMS_TO_TICKS(1000)) {
+            ESP_LOGW(TAG, "i2s rx %s nread=%u", esp_err_to_name(err), (unsigned)nread);
+            t_rx_log = now;
+        }
+        return err;
+    }
+    int frames = (int)(nread / sizeof(int16_t));
+    if (frames < ns) {
+        memset(buffer + frames, 0, (size_t)(ns - frames) * sizeof(int16_t));
+    }
+
+    static bool s_dumped;
+    if (!s_dumped && frames > 0) {
+        s_dumped = true;
+        ESP_LOGI(TAG, "mic raw %d %d %d %d",
+                 (int)buffer[0], (int)buffer[1], (int)buffer[2], (int)buffer[3]);
+    }
+    return ESP_OK;
 }
 
 int bsp_get_feed_channel(void)

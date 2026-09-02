@@ -91,21 +91,6 @@
 #define GPIO_PWR_ON_LEVEL   (1)
 
 /**
- * @brief 电池与充电检测
- *
- * GPIO1：ADC 采电池分压（默认 2:1，Vbat = Vadc×2）
- * GPIO2：TP4056 CHRG（低电平=充电中）
- * GPIO3：TP4056 STDBY（低电平=已充满）
- */
-#define GPIO_BATTERY_ADC        (GPIO_NUM_1)
-#define GPIO_CHARGE_DET         (GPIO_NUM_2)
-#define GPIO_STDBY_DET          (GPIO_NUM_3)
-#define CHARGE_ACTIVE_LEVEL     (0)
-#define BATTERY_DIVIDER         (2.0f)
-#define BATTERY_EMPTY_MV        (3300)
-#define BATTERY_FULL_MV         (4200)
-
-/**
  * @brief 红/绿双色指示灯（共阴高电平亮；共阳则把 LED_ACTIVE_LEVEL 改为 0）
  *
  * 红绿闪：启动中
