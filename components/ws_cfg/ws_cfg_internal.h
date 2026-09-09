@@ -42,6 +42,12 @@ esp_err_t ws_cfg_send_text(const char *json);
 /** @brief 发送 PCM16 二进制帧（仅 session_task 上下文调用） */
 esp_err_t ws_cfg_send_pcm(const uint8_t *data, int len);
 
+/** @brief 发送当前句结束标记 */
+esp_err_t ws_cfg_send_commit(void);
+
+/** @brief 发送会话结束标记 */
+esp_err_t ws_cfg_send_bye(void);
+
 /**
  * @brief 本次下行 PCM 是否收全（对照 header.bytes；无 header 则有数据即算完整）
  */

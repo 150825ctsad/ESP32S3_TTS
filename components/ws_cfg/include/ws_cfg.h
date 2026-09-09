@@ -22,6 +22,17 @@ esp_err_t ws_cfg_init(void);
  */
 esp_err_t ws_cfg_set_uri(const char *uri);
 
+/** @brief 设置默认语音会话是否携带 screen=1（默认 false） */
+void ws_cfg_set_screen(bool enabled);
+bool ws_cfg_screen_enabled(void);
+
+/** @brief 根据设备 MAC 生成默认 /ws/chat/{mac} 会话地址 */
+esp_err_t ws_cfg_set_default_chat_uri(const char *mac);
+
+typedef void (*ws_cfg_text_cb_t)(const char *text);
+/** @brief 注册云端识别文字回调（screen=1 时可由显示驱动消费） */
+void ws_cfg_set_text_cb(ws_cfg_text_cb_t cb);
+
 /** @brief 是否已有唤醒对讲 WebSocket 地址（不含 TCM 推送通道） */
 bool ws_cfg_has_uri(void);
 

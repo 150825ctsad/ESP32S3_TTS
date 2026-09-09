@@ -37,6 +37,8 @@ static esp_websocket_client_handle_t s_client = NULL;
 static char s_uri_dialog[WS_URI_MAX] = {0};
 static char s_uri_push[WS_URI_MAX] = {0};
 static char s_uri_active[WS_URI_MAX] = {0};
+static bool s_screen_enabled = false;
+static ws_cfg_text_cb_t s_text_cb = NULL;
 
 static EventGroupHandle_t s_evt = NULL;
 static ringbuf_handle_t s_ring = NULL;
@@ -274,8 +276,24 @@ static void ws_event_cb(void *arg, esp_event_base_t base,
                     if (s_evt) xEventGroupSetBits(s_evt, WS_EVT_TTS_ERROR);
                 } else if (strcmp(type->valuestring, "tts_start") == 0) {
                     ESP_LOGI(TAG, "Received tts_start");
+                } else if (strcmp(type->valuestring, "text") == 0 ||
+                           strcmp(type->valuestring, "transcript") == 0) {
+                    cJSON *text = cJSON_GetObjectItemCaseSensitive(root, "text");
+                    if (!cJSON_IsString(text) || !text->valuestring) {
+                        text = cJSON_GetObjectItemCaseSensitive(root, "transcript");
+                    }
+                    if (cJSON_IsString(text) && text->valuestring) {
+                        ESP_LOGI(TAG, "Recognized text: %s", text->valuestring);
+                        if (s_text_cb) s_text_cb(text->valuestring);
+                    }
                 } else {
-                    ESP_LOGI(TAG, "Unknown control: %.*s", data->data_len, data->data_ptr);
+                    cJSON *text = cJSON_GetObjectItemCaseSensitive(root, "text");
+                    if (cJSON_IsString(text) && text->valuestring) {
+                        ESP_LOGI(TAG, "Recognized text: %s", text->valuestring);
+                        if (s_text_cb) s_text_cb(text->valuestring);
+                    } else {
+                        ESP_LOGI(TAG, "Unknown control: %.*s", data->data_len, data->data_ptr);
+                    }
                 }
             }
             cJSON_Delete(root);
@@ -314,6 +332,10 @@ esp_err_t ws_cfg_set_uri(const char *uri)
     } else {
         snprintf(tmp, sizeof(tmp), "%s", uri);
     }
+    const char *screen_q = strstr(tmp, "screen=");
+    if (screen_q && (screen_q[7] == '0' || screen_q[7] == '1')) {
+        s_screen_enabled = (screen_q[7] == '1');
+    }
     if (strstr(tmp, "/tcm/") != NULL) {
         snprintf(s_uri_push, sizeof(s_uri_push), "%s", tmp);
         ESP_LOGI(TAG, "WS push uri saved: %s", s_uri_push);
@@ -322,6 +344,32 @@ esp_err_t ws_cfg_set_uri(const char *uri)
         ESP_LOGI(TAG, "WS dialog uri saved: %s", s_uri_dialog);
     }
     return ESP_OK;
+}
+
+void ws_cfg_set_screen(bool enabled)
+{
+    s_screen_enabled = enabled;
+}
+
+bool ws_cfg_screen_enabled(void)
+{
+    return s_screen_enabled;
+}
+
+esp_err_t ws_cfg_set_default_chat_uri(const char *mac)
+{
+    if (mac == NULL || mac[0] == '\0') return ESP_ERR_INVALID_ARG;
+    char uri[WS_URI_MAX];
+    int n = snprintf(uri, sizeof(uri),
+                     "ws://iot.gejia.tech/ws/chat/%s?screen=%d",
+                     mac, s_screen_enabled ? 1 : 0);
+    if (n <= 0 || n >= (int)sizeof(uri)) return ESP_ERR_INVALID_ARG;
+    return ws_cfg_set_uri(uri);
+}
+
+void ws_cfg_set_text_cb(ws_cfg_text_cb_t cb)
+{
+    s_text_cb = cb;
 }
 
 bool ws_cfg_has_uri(void)
@@ -413,10 +461,23 @@ esp_err_t ws_cfg_send_text(const char *json)
         ESP_LOGW(TAG, "Not connected, text dropped");
         return ESP_ERR_INVALID_STATE;
     }
-    int r = esp_websocket_client_send_text(s_client, json,
+    int attempts = 2;
+    int r = -1;
+    for (int i = 0; i < attempts; i++) {
+        r = esp_websocket_client_send_text(s_client, json,
                                            (int)strlen(json),
                                            pdMS_TO_TICKS(WS_SEND_TIMEOUT_MS));
-    return r < 0 ? ESP_FAIL : ESP_OK;
+        if (r > 0) break;
+        /* short delay before retry */
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    if (r <= 0) {
+        ESP_LOGW(TAG, "WS send_text returned %d after retries, closing connection", r);
+        /* Treat 0 (no bytes written) as an error and close client so higher-level logic can recover */
+        ws_cfg_disconnect();
+        return ESP_FAIL;
+    }
+    return ESP_OK;
 }
 
 esp_err_t ws_cfg_send_pcm(const uint8_t *data, int len)
@@ -425,9 +486,31 @@ esp_err_t ws_cfg_send_pcm(const uint8_t *data, int len)
         ESP_LOGW(TAG, "Not connected, pcm dropped");
         return ESP_ERR_INVALID_STATE;
     }
-    int r = esp_websocket_client_send_bin(s_client, (const char *)data, len,
+    int attempts = 2;
+    int r = -1;
+    for (int i = 0; i < attempts; i++) {
+        r = esp_websocket_client_send_bin(s_client, (const char *)data, len,
                                           pdMS_TO_TICKS(WS_SEND_TIMEOUT_MS));
-    return r < 0 ? ESP_FAIL : ESP_OK;
+        if (r > 0) break;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    if (r <= 0) {
+        ESP_LOGW(TAG, "WS send_bin returned %d after retries, closing connection", r);
+        /* Treat 0 (no bytes written) as an error and close client so higher-level logic can recover */
+        ws_cfg_disconnect();
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+esp_err_t ws_cfg_send_commit(void)
+{
+    return ws_cfg_send_text("{\"type\":\"commit\"}");
+}
+
+esp_err_t ws_cfg_send_bye(void)
+{
+    return ws_cfg_send_text("{\"type\":\"bye\"}");
 }
 
 bool ws_cfg_pcm_complete(void)

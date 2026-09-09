@@ -1,0 +1,10 @@
+menu "Voice WebSocket"
+
+config WS_SCREEN_ENABLED
+    bool "Send recognition text to the device"
+    default n
+    help
+        Append screen=1 to the default chat URL and advertise screen=true
+        in the WebSocket start message. Enable this for boards with a display.
+
+endmenu

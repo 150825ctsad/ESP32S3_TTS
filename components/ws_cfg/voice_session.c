@@ -26,6 +26,9 @@
 #include "esp_vadn_models.h"
 #include "model_path.h"
 #include "sdkconfig.h"
+#ifndef CONFIG_WS_SCREEN_ENABLED
+#define CONFIG_WS_SCREEN_ENABLED 0
+#endif
 #include "esp_heap_caps.h"
 #include "cJSON.h"
 #include "ringbuf.h"
@@ -102,6 +105,14 @@ static volatile int s_afe_chunks_fed = 0;
 static volatile sess_state_t s_state = SESS_IDLE;
 static char s_device[13] = "000000000000";
 static volatile bool s_had_speech = false;
+
+/* Recent captured samples circular buffer for debug dump when AFE reports empty ringbuffer */
+static int16_t s_recent_samples[256]; /* stores recent mono samples */
+static int s_recent_idx = 0;        /* next write index (wraps) */
+static TickType_t s_last_afe_dump = 0; /* last time we dumped samples (rate-limit) */
+/* AFE consecutive empty/fail counter to trigger a reset if persistent */
+static int s_afe_fail_count = 0; /* incremented when fetch returns empty/ESP_FAIL */
+static const int S_AFE_FAIL_RESET_THRESHOLD = 3; /* reset after this many consecutive fails */
 
 static char s_push_msgid[80];
 static char s_push_tts[768];
@@ -305,6 +316,65 @@ static void afe_fetch_task(void *arg)
                 ESP_LOGI(TAG, "!!! Wake word detected (AFE) !!!");
                 tts_abort();
                 if (s_evt) xEventGroupSetBits(s_evt, SESS_EVT_WAKE);
+            } else if (!res || res->ret_value == ESP_FAIL) {
+                /* AFE reported empty ringbuffer or failure. Rate-limited dump of recent samples for debugging. */
+                TickType_t now = xTaskGetTickCount();
+                if (s_last_afe_dump == 0 || (now - s_last_afe_dump) >= pdMS_TO_TICKS(2000)) {
+                    s_last_afe_dump = now;
+                    ESP_LOGW(TAG, "AFE fetch failed (wake). pipe=%d fetch_en=%d chunks_fed=%d state=%d",
+                             (int)pipe, (int)s_afe_fetch_en, (int)s_afe_chunks_fed, (int)s_state);
+                    /* print last 32 samples */
+                    int nprint = 32;
+                    char buf[256];
+                    int off = 0;
+                    off += snprintf(buf + off, sizeof(buf) - off, "recent_samples[");
+                    int idx = s_recent_idx - nprint;
+                    if (idx < 0) idx += (int)(sizeof(s_recent_samples)/sizeof(s_recent_samples[0]));
+                    for (int i = 0; i < nprint; i++) {
+                        int ridx = (idx + i) % (int)(sizeof(s_recent_samples)/sizeof(s_recent_samples[0]));
+                        off += snprintf(buf + off, sizeof(buf) - off, "%d%s",
+                                         s_recent_samples[ridx], (i + 1 < nprint) ? "," : "");
+                        if (off >= (int)sizeof(buf) - 32) break;
+                    }
+                    off += snprintf(buf + off, sizeof(buf) - off, "]");
+                    ESP_LOGW(TAG, "%s", buf);
+                }
+                /* success -> clear fail counter */
+                s_afe_fail_count = 0;
+            } else if (!res || res->ret_value == ESP_FAIL) {
+                /* AFE reported empty ringbuffer or failure. Rate-limited dump of recent samples for debugging. */
+                TickType_t now = xTaskGetTickCount();
+                if (s_last_afe_dump == 0 || (now - s_last_afe_dump) >= pdMS_TO_TICKS(2000)) {
+                    s_last_afe_dump = now;
+                    ESP_LOGW(TAG, "AFE fetch failed (wake). pipe=%d fetch_en=%d chunks_fed=%d state=%d",
+                             (int)pipe, (int)s_afe_fetch_en, (int)s_afe_chunks_fed, (int)s_state);
+                    /* print last 32 samples */
+                    int nprint = 32;
+                    char buf[256];
+                    int off = 0;
+                    off += snprintf(buf + off, sizeof(buf) - off, "recent_samples[");
+                    int idx = s_recent_idx - nprint;
+                    if (idx < 0) idx += (int)(sizeof(s_recent_samples)/sizeof(s_recent_samples[0]));
+                    for (int i = 0; i < nprint; i++) {
+                        int ridx = (idx + i) % (int)(sizeof(s_recent_samples)/sizeof(s_recent_samples[0]));
+                        off += snprintf(buf + off, sizeof(buf) - off, "%d%s",
+                                         s_recent_samples[ridx], (i + 1 < nprint) ? "," : "");
+                        if (off >= (int)sizeof(buf) - 32) break;
+                    }
+                    off += snprintf(buf + off, sizeof(buf) - off, "]");
+                    ESP_LOGW(TAG, "%s", buf);
+                }
+                /* increment fail counter and attempt reset when persistent */
+                s_afe_fail_count++;
+                if (s_afe_fail_count >= S_AFE_FAIL_RESET_THRESHOLD) {
+                    ESP_LOGW(TAG, "AFE persistent empty: resetting AFE wake buffer (fail_count=%d)", s_afe_fail_count);
+                    if (s_afe_wake && s_afe_wake_data && s_afe_wake->reset_buffer) {
+                        s_afe_wake->reset_buffer(s_afe_wake_data);
+                    }
+                    s_afe_chunks_fed = 0;
+                    s_afe_fail_count = 0;
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                }
             }
         } else if (pipe == AFE_PIPE_VC && s_afe_vc && s_afe_vc_data) {
             res = s_afe_vc->fetch_with_delay(s_afe_vc_data, pdMS_TO_TICKS(50));
@@ -318,6 +388,40 @@ static void afe_fetch_task(void *arg)
                     } else if (res->vad_state == VAD_SILENCE && s_had_speech) {
                         if (s_evt) xEventGroupSetBits(s_evt, SESS_EVT_VAD_END);
                     }
+                }
+                /* success -> clear fail counter */
+                s_afe_fail_count = 0;
+            } else if (!res || res->ret_value == ESP_FAIL) {
+                TickType_t now = xTaskGetTickCount();
+                if (s_last_afe_dump == 0 || (now - s_last_afe_dump) >= pdMS_TO_TICKS(2000)) {
+                    s_last_afe_dump = now;
+                    ESP_LOGW(TAG, "AFE fetch failed (vc). pipe=%d fetch_en=%d chunks_fed=%d state=%d",
+                             (int)pipe, (int)s_afe_fetch_en, (int)s_afe_chunks_fed, (int)s_state);
+                    int nprint = 32;
+                    char buf[256];
+                    int off = 0;
+                    off += snprintf(buf + off, sizeof(buf) - off, "recent_samples[");
+                    int idx = s_recent_idx - nprint;
+                    if (idx < 0) idx += (int)(sizeof(s_recent_samples)/sizeof(s_recent_samples[0]));
+                    for (int i = 0; i < nprint; i++) {
+                        int ridx = (idx + i) % (int)(sizeof(s_recent_samples)/sizeof(s_recent_samples[0]));
+                        off += snprintf(buf + off, sizeof(buf) - off, "%d%s",
+                                         s_recent_samples[ridx], (i + 1 < nprint) ? "," : "");
+                        if (off >= (int)sizeof(buf) - 32) break;
+                    }
+                    off += snprintf(buf + off, sizeof(buf) - off, "]");
+                    ESP_LOGW(TAG, "%s", buf);
+                }
+                /* increment fail counter and attempt reset when persistent */
+                s_afe_fail_count++;
+                if (s_afe_fail_count >= S_AFE_FAIL_RESET_THRESHOLD) {
+                    ESP_LOGW(TAG, "AFE persistent empty: resetting AFE vc buffer (fail_count=%d)", s_afe_fail_count);
+                    if (s_afe_vc && s_afe_vc_data && s_afe_vc->reset_buffer) {
+                        s_afe_vc->reset_buffer(s_afe_vc_data);
+                    }
+                    s_afe_chunks_fed = 0;
+                    s_afe_fail_count = 0;
+                    vTaskDelay(pdMS_TO_TICKS(10));
                 }
             }
         } else {
@@ -401,6 +505,10 @@ static void session_teardown(bool normal)
         play_enable(false);
         ESP_LOGW(TAG, "Abort playback");
     }
+    /* 单句模式：当前句播放完成后显式结束整个 WebSocket 会话。 */
+    if (ws_cfg_is_connected()) {
+        ws_cfg_send_bye();
+    }
     ws_cfg_disconnect();
     afe_resume(AFE_PIPE_WAKE);
     if (s_evt) {
@@ -444,6 +552,7 @@ static void start_cloud_session(TickType_t *t_connect_start, bool push)
         xEventGroupClearBits(s_evt, SESS_EVT_PUSH);
     }
     afe_pause();
+    if (s_up_ring) rb_reset(s_up_ring);
     if (ws_cfg_connect(push) == ESP_OK) {
         s_state = SESS_CONNECTING;
         *t_connect_start = xTaskGetTickCount();
@@ -499,6 +608,7 @@ esp_err_t ws_cfg_request_push(const char *msg_id, const char *tts_text)
         WS_EVT_CONNECTED | WS_EVT_DISCONNECTED |
         WS_EVT_TTS_DONE | WS_EVT_TTS_ERROR |
         SESS_EVT_WAKE | SESS_EVT_VAD_END);
+    if (s_push_mux) xSemaphoreTake(s_push_mux, portMAX_DELAY);
     bool busy = s_push_active ||
                 (s_evt && (xEventGroupGetBits(s_evt) & SESS_EVT_PUSH));
     if (busy) {
@@ -560,17 +670,35 @@ static void player_task(void *arg)
 /*  session_task                                                     */
 /* ================================================================ */
 
-static void stream_send_end(int16_t *tx_frame, int *tx_n, TickType_t t_stream_start)
+static bool stream_send_commit(int16_t *tx_frame, int *tx_n, TickType_t t_stream_start)
 {
     if (*tx_n > 0) {
-        ws_cfg_send_pcm((uint8_t *)tx_frame, *tx_n * 2);
+        if (ws_cfg_send_pcm((uint8_t *)tx_frame, *tx_n * 2) != ESP_OK) {
+            ESP_LOGW(TAG, "stream_send_commit: ws_cfg_send_pcm failed");
+            *tx_n = 0;
+            return false;
+        }
         *tx_n = 0;
     }
     int ms = (int)((xTaskGetTickCount() - t_stream_start) * portTICK_PERIOD_MS);
-    char end_json[64];
-    snprintf(end_json, sizeof(end_json), "{\"type\":\"end\",\"duration_ms\":%d}", ms);
-    ws_cfg_send_text(end_json);
-    ESP_LOGI(TAG, "Stream end (%d ms), waiting tts", ms);
+    if (ws_cfg_send_commit() != ESP_OK) {
+        ESP_LOGW(TAG, "stream_send_commit: ws_cfg_send_commit failed");
+        return false;
+    }
+    ESP_LOGI(TAG, "Stream commit (%d ms), waiting tts", ms);
+    return true;
+}
+
+static bool drain_uplink_ring(void)
+{
+    if (!s_up_ring) return true;
+    uint8_t buf[PCM_FRAME_SAMPLES * 2];
+    for (;;) {
+        int n = rb_read(s_up_ring, (char *)buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        if (ws_cfg_send_pcm(buf, n) != ESP_OK) return false;
+    }
+    return true;
 }
 
 static void session_task(void *arg)
@@ -607,34 +735,53 @@ static void session_task(void *arg)
         if (nsamp > (int)(sizeof(mono) / sizeof(mono[0]))) nsamp = (int)(sizeof(mono) / sizeof(mono[0]));
         for (int i = 0; i < nsamp; i++) mono[i] = frame[ch * i];
 
-        // /* 每秒打一次麦能量：安静几十~几百，对着麦说话应明显升高 */
-        // {
-        //     static uint32_t abs_acc, peak, frames;
-        //     static TickType_t t_log;
-        //     uint32_t frame_peak = 0;
-        //     uint32_t abs_sum = 0;
-        //     for (int i = 0; i < nsamp; i++) {
-        //         int v = mono[i];
-        //         uint32_t a = (uint32_t)(v < 0 ? -v : v);
-        //         abs_sum += a;
-        //         if (a > frame_peak) frame_peak = a;
-        //     }
-        //     abs_acc += abs_sum / (uint32_t)nsamp;
-        //     if (frame_peak > peak) peak = frame_peak;
-        //     frames++;
-        //     TickType_t now = xTaskGetTickCount();
-        //     if (t_log == 0 || (now - t_log) >= pdMS_TO_TICKS(1000)) {
-        //         ESP_LOGI(TAG, "mic |avg|=%u peak=%u frames=%u",
-        //                  (unsigned)(frames ? abs_acc / frames : 0),
-        //                  (unsigned)peak, (unsigned)frames);
-        //         abs_acc = 0;
-        //         peak = 0;
-        //         frames = 0;
-        //         t_log = now;
-        //     }
-        // }
+        /* 每秒打印一次麦克风能量统计，并输出前几个样本值以便调试 */
+        {
+            static uint32_t abs_acc = 0, peak = 0, frames = 0;
+            static TickType_t t_log = 0;
+            uint32_t frame_peak = 0;
+            uint32_t abs_sum = 0;
+            for (int i = 0; i < nsamp; i++) {
+                int v = mono[i];
+                uint32_t a = (uint32_t)(v < 0 ? -v : v);
+                abs_sum += a;
+                if (a > frame_peak) frame_peak = a;
+            }
+            /* 防止除以 0 */
+            if (nsamp > 0) {
+                abs_acc += abs_sum / (uint32_t)nsamp;
+            }
+            if (frame_peak > peak) peak = frame_peak;
+            frames++;
+            TickType_t now = xTaskGetTickCount();
+            if (t_log == 0 || (now - t_log) >= pdMS_TO_TICKS(1000)) {
+                /* 构造前几个样本的简短字符串（最多 8 个样本） */
+                int samples_to_print = nsamp < 8 ? nsamp : 8;
+                char sample_buf[128];
+                int off = 0;
+                off += snprintf(sample_buf + off, sizeof(sample_buf) - off, "samples[");
+                for (int si = 0; si < samples_to_print; si++) {
+                    off += snprintf(sample_buf + off, sizeof(sample_buf) - off, "%d%s",
+                                     mono[si], (si + 1 < samples_to_print) ? ", " : "");
+                }
+                off += snprintf(sample_buf + off, sizeof(sample_buf) - off, "]");
+
+                ESP_LOGI(TAG, "mic |avg|=%u peak=%u frames=%u %s",
+                         (unsigned)(frames ? abs_acc / frames : 0),
+                         (unsigned)peak, (unsigned)frames, sample_buf);
+                abs_acc = 0;
+                peak = 0;
+                frames = 0;
+                t_log = now;
+            }
+        }
 
         if (use_afe_wake || use_afe_vc) {
+            /* Append mono samples to recent circular buffer for debug dumps */
+            for (int i = 0; i < nsamp; i++) {
+                s_recent_samples[s_recent_idx++] = mono[i];
+                if (s_recent_idx >= (int)(sizeof(s_recent_samples)/sizeof(s_recent_samples[0]))) s_recent_idx = 0;
+            }
             afe_feed_mono(mono, nsamp);
         }
 
@@ -730,10 +877,11 @@ static void session_task(void *arg)
                 } else {
                     afe_resume(AFE_PIPE_WAKE);
                 }
-                char start_json[160];
+                const char *screen = ws_cfg_screen_enabled() ? "true" : "false";
+                char start_json[192];
                 snprintf(start_json, sizeof(start_json),
-                    "{\"type\":\"start\",\"device\":\"%s\",\"wake\":\"nihaoxiaoyi\"}",
-                    s_device);
+                    "{\"type\":\"start\",\"format\":\"pcm\",\"codec\":\"pcm_s16le\",\"sampleRate\":16000,\"channels\":1,\"bits\":16,\"screen\":%s}",
+                    screen);
                 ws_cfg_send_text(start_json);
                 tx_n = 0;
                 hangover = 0;
@@ -754,13 +902,19 @@ static void session_task(void *arg)
                 char up[PCM_FRAME_SAMPLES * 2];
                 int n = rb_read(s_up_ring, up, sizeof(up), 0);
                 if (n > 0) {
-                    ws_cfg_send_pcm((uint8_t *)up, n);
+                    if (ws_cfg_send_pcm((uint8_t *)up, n) != ESP_OK) {
+                        session_teardown(false);
+                        break;
+                    }
                 }
             } else {
                 for (int i = 0; i < nsamp; i++) {
                     tx_frame[tx_n++] = mono[i];
                     if (tx_n == PCM_FRAME_SAMPLES) {
-                        ws_cfg_send_pcm((uint8_t *)tx_frame, sizeof(tx_frame));
+                        if (ws_cfg_send_pcm((uint8_t *)tx_frame, sizeof(tx_frame)) != ESP_OK) {
+                            session_teardown(false);
+                            break;
+                        }
                         tx_n = 0;
                     }
                 }
@@ -787,9 +941,17 @@ static void session_task(void *arg)
             break;
 
 stream_end:
-            stream_send_end(tx_frame, &tx_n, t_stream_start);
-            afe_pause();
+            /* 先切换状态，阻止 fetch 任务继续向上行环形缓冲写入。 */
             s_state = SESS_WAIT_TTS;
+            afe_pause();
+            if (!drain_uplink_ring()) {
+                session_teardown(false);
+                break;
+            }
+            if (!stream_send_commit(tx_frame, &tx_n, t_stream_start)) {
+                session_teardown(false);
+                break;
+            }
             t_wait_start = xTaskGetTickCount();
             break;
         }
@@ -959,6 +1121,7 @@ out:
 
 esp_err_t ws_cfg_init(void)
 {
+    ws_cfg_set_screen(CONFIG_WS_SCREEN_ENABLED != 0);
     if (s_evt == NULL) s_evt = xEventGroupCreate();
     if (s_ring == NULL) s_ring = rb_create(RING_BLOCK_SIZE, RING_N_BLOCKS);
     ESP_LOGI(TAG, "Play cache %d KB, prebuf %d ms",
@@ -979,6 +1142,8 @@ esp_err_t ws_cfg_init(void)
         snprintf(s_device, sizeof(s_device),
                  "%02x%02x%02x%02x%02x%02x",
                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        /* MQTT 下发地址可以覆盖默认地址；没有下发时直接连接云端对讲路径。 */
+        ws_cfg_set_default_chat_uri(s_device);
     }
 
     srmodel_list_t *models = esp_srmodel_init("model");
