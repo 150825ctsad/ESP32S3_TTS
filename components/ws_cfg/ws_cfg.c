@@ -257,6 +257,12 @@ static void ws_event_cb(void *arg, esp_event_base_t base,
                         ESP_LOGW(TAG, "TTS header channels=%d, only mono is played",
                                  (int)ch->valuedouble);
                     }
+                } else if (strcmp(type->valuestring, "ready") == 0) {
+                    ESP_LOGI(TAG, "Received ready");
+                    if (s_evt) xEventGroupSetBits(s_evt, WS_EVT_READY);
+                } else if (strcmp(type->valuestring, "listening") == 0) {
+                    ESP_LOGI(TAG, "Received listening (server ready for PCM)");
+                    if (s_evt) xEventGroupSetBits(s_evt, WS_EVT_LISTENING);
                 } else if (strcmp(type->valuestring, "done") == 0 ||
                            strcmp(type->valuestring, "end") == 0) {
                     ESP_LOGI(TAG, "Received %s (pcm in=%d out=%d)",

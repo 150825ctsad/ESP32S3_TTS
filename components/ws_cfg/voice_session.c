@@ -62,6 +62,7 @@
 #define VAD_HANGOVER         32
 
 #define CONNECT_TIMEOUT_MS   25000
+#define LISTEN_TIMEOUT_MS    5000
 #define STREAM_MAX_MS        10000
 #define WAIT_TTS_TIMEOUT_MS  5000
 #define PLAY_MAX_MS          30000
@@ -69,6 +70,7 @@
 typedef enum {
     SESS_IDLE = 0,
     SESS_CONNECTING,
+    SESS_WAIT_LISTENING,
     SESS_STREAMING,
     SESS_WAIT_TTS,
     SESS_PLAYING,
@@ -211,6 +213,23 @@ static void afe_feed_mono(const int16_t *mono, int nsamp)
             acc_n = 0;
         }
     }
+}
+
+/* AFE VAD can briefly report speech on startup noise. Require a minimum
+ * post-NS energy before arming the silence-to-end transition. */
+static bool afe_frame_has_speech_energy(const void *data, int data_size)
+{
+    if (data == NULL || data_size < (int)sizeof(int16_t)) {
+        return false;
+    }
+    const int16_t *samples = (const int16_t *)data;
+    int count = data_size / (int)sizeof(int16_t);
+    long long energy = 0;
+    for (int i = 0; i < count; i++) {
+        long long v = samples[i];
+        energy += v * v;
+    }
+    return energy >= (long long)VAD_RMS_THRESHOLD * VAD_RMS_THRESHOLD * count;
 }
 
 static bool afe_init_wake(srmodel_list_t *models)
@@ -383,7 +402,8 @@ static void afe_fetch_task(void *arg)
                     rb_write(s_up_ring, (char *)res->data, res->data_size, 0);
                 }
                 if (s_state == SESS_STREAMING) {
-                    if (res->vad_state == VAD_SPEECH) {
+                    bool speech_energy = afe_frame_has_speech_energy(res->data, res->data_size);
+                    if (res->vad_state == VAD_SPEECH && speech_energy) {
                         s_had_speech = true;
                     } else if (res->vad_state == VAD_SILENCE && s_had_speech) {
                         if (s_evt) xEventGroupSetBits(s_evt, SESS_EVT_VAD_END);
@@ -546,6 +566,7 @@ static void start_cloud_session(TickType_t *t_connect_start, bool push)
     if (s_push_mux) xSemaphoreGive(s_push_mux);
     xEventGroupClearBits(s_evt,
         WS_EVT_CONNECTED | WS_EVT_DISCONNECTED |
+        WS_EVT_READY | WS_EVT_LISTENING |
         WS_EVT_TTS_DONE | WS_EVT_TTS_ERROR |
         SESS_EVT_WAKE | SESS_EVT_VAD_END);
     if (push) {
@@ -606,6 +627,7 @@ esp_err_t ws_cfg_request_push(const char *msg_id, const char *tts_text)
     play_enable(false);
     xEventGroupClearBits(s_evt,
         WS_EVT_CONNECTED | WS_EVT_DISCONNECTED |
+        WS_EVT_READY | WS_EVT_LISTENING |
         WS_EVT_TTS_DONE | WS_EVT_TTS_ERROR |
         SESS_EVT_WAKE | SESS_EVT_VAD_END);
     if (s_push_mux) xSemaphoreTake(s_push_mux, portMAX_DELAY);
@@ -871,23 +893,23 @@ static void session_task(void *arg)
                     s_state = SESS_WAIT_TTS;
                     break;
                 }
-                ESP_LOGI(TAG, "WS connected, start streaming");
-                if (s_afe_vc && s_afe_vc_data) {
-                    afe_resume(AFE_PIPE_VC);
-                } else {
-                    afe_resume(AFE_PIPE_WAKE);
-                }
+                ESP_LOGI(TAG, "WS connected, sending start; wait listening");
                 const char *screen = ws_cfg_screen_enabled() ? "true" : "false";
                 char start_json[192];
                 snprintf(start_json, sizeof(start_json),
                     "{\"type\":\"start\",\"format\":\"pcm\",\"codec\":\"pcm_s16le\",\"sampleRate\":16000,\"channels\":1,\"bits\":16,\"screen\":%s}",
                     screen);
-                ws_cfg_send_text(start_json);
+                if (ws_cfg_send_text(start_json) != ESP_OK) {
+                    bool push = s_push_active;
+                    session_teardown(false);
+                    if (!push) ws_cfg_play_tone();
+                    break;
+                }
                 tx_n = 0;
                 hangover = 0;
                 s_had_speech = false;
-                t_stream_start = xTaskGetTickCount();
-                s_state = SESS_STREAMING;
+                t_connect_start = xTaskGetTickCount();
+                s_state = SESS_WAIT_LISTENING;
             } else if ((xEventGroupGetBits(s_evt) & WS_EVT_DISCONNECTED) ||
                        (xTaskGetTickCount() - t_connect_start > pdMS_TO_TICKS(CONNECT_TIMEOUT_MS))) {
                 ESP_LOGW(TAG, "WS connect failed/timeout");
@@ -896,6 +918,34 @@ static void session_task(void *arg)
                 if (!push) ws_cfg_play_tone();
             }
             break;
+
+        case SESS_WAIT_LISTENING: {
+            EventBits_t bits = xEventGroupGetBits(s_evt);
+            if (bits & WS_EVT_LISTENING) {
+                xEventGroupClearBits(s_evt, WS_EVT_LISTENING | WS_EVT_READY);
+                ESP_LOGI(TAG, "WS listening, start PCM streaming");
+                if (s_afe_vc && s_afe_vc_data) {
+                    afe_resume(AFE_PIPE_VC);
+                } else {
+                    afe_resume(AFE_PIPE_WAKE);
+                }
+                t_stream_start = xTaskGetTickCount();
+                s_state = SESS_STREAMING;
+            } else if (bits & WS_EVT_TTS_ERROR) {
+                xEventGroupClearBits(s_evt, WS_EVT_TTS_ERROR);
+                ESP_LOGW(TAG, "WS server rejected start before listening");
+                bool push = s_push_active;
+                session_teardown(false);
+                if (!push) ws_cfg_play_tone();
+            } else if ((bits & WS_EVT_DISCONNECTED) ||
+                       (xTaskGetTickCount() - t_connect_start > pdMS_TO_TICKS(LISTEN_TIMEOUT_MS))) {
+                ESP_LOGW(TAG, "WS connected but server did not become listening");
+                bool push = s_push_active;
+                session_teardown(false);
+                if (!push) ws_cfg_play_tone();
+            }
+            break;
+        }
 
         case SESS_STREAMING: {
             if (use_afe_vc && s_up_ring) {

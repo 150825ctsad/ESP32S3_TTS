@@ -15,6 +15,8 @@ extern "C" {
 #define WS_EVT_DISCONNECTED (1 << 1)   /* WS 断开（非主动） */
 #define WS_EVT_TTS_DONE     (1 << 2)   /* 收到 {"type":"done"} 或 {"type":"end"} */
 #define WS_EVT_TTS_ERROR    (1 << 3)   /* 收到 {"type":"error"} */
+#define WS_EVT_READY        (1 << 4)   /* server handshake ready */
+#define WS_EVT_LISTENING    (1 << 5)   /* server is ready to receive PCM */
 #define SESS_EVT_PUSH       (1 << 10)  /* MQTT 下发 ws，请求立刻连云端播 TTS */
 
 /**
